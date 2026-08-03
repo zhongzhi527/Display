@@ -1,0 +1,3071 @@
+#include <Arduino.h>
+#include <DualScaleBleProtocol.h>
+#include <NimBLEDevice.h>
+#include <Preferences.h>
+#include <TFT_eSPI.h>
+#include <Wire.h>
+#include <driver/gpio.h>
+#include <esp_sleep.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+#include <math.h>
+
+#if !defined(CONFIG_BT_ENABLED)
+#error Bluetooth is not enabled for this ESP32 build.
+#endif
+
+namespace {
+
+// Guition JC2432W328C display and touch connections.
+constexpr int TFT_BACKLIGHT_PIN = 27;
+constexpr int TOUCH_SDA_PIN = 33;
+constexpr int TOUCH_SCL_PIN = 32;
+constexpr int TOUCH_RESET_PIN = 25;
+constexpr int TOUCH_INTERRUPT_PIN = 21;
+constexpr uint8_t CST820_ADDRESS = 0x15;
+
+constexpr int SCREEN_WIDTH = 240;
+constexpr int SCREEN_HEIGHT = 320;
+constexpr int WEIGHT_SPRITE_WIDTH = 145;
+constexpr int WEIGHT_SPRITE_HEIGHT = 42;
+constexpr int DASHBOARD_WEIGHT_X = 83;
+constexpr int DASHBOARD_SCALE_A_WEIGHT_Y = 57;
+constexpr int DASHBOARD_SCALE_B_WEIGHT_Y = 122;
+constexpr int DASHBOARD_TOTAL_WEIGHT_Y = 184;
+constexpr int16_t DASHBOARD_SCALE_PANEL_Y[] = {47, 112};
+constexpr uint8_t BACKLIGHT_PWM_CHANNEL = 0;
+constexpr uint32_t BACKLIGHT_PWM_FREQUENCY_HZ = 5000;
+constexpr uint8_t BACKLIGHT_PWM_RESOLUTION_BITS = 8;
+constexpr uint8_t MIN_BRIGHTNESS_PERCENT = 10;
+constexpr uint8_t MAX_BRIGHTNESS_PERCENT = 100;
+constexpr uint8_t BRIGHTNESS_STEP_PERCENT = 10;
+constexpr uint8_t DEFAULT_BRIGHTNESS_PERCENT = 100;
+constexpr uint16_t DEFAULT_CPU_FREQUENCY_MHZ = 240;
+
+constexpr char LOCAL_BLUETOOTH_NAME[] = "LOAD_CELL_DISPLAY";
+constexpr char SETTINGS_NAMESPACE[] = "display_ui";
+constexpr char BRIGHTNESS_KEY[] = "brightness";
+constexpr char CPU_FREQUENCY_KEY[] = "cpu_mhz";
+constexpr uint32_t RECONNECT_INTERVAL_MS = 3000;
+constexpr uint32_t BLE_CONNECT_TIMEOUT_MS = 5000;
+constexpr uint32_t BLE_SCAN_WINDOW_MS = 4000;
+constexpr uint32_t BLE_SCAN_PAUSE_MS = 6000;
+constexpr uint8_t MAX_ADDRESS_CONNECT_FAILURES = 3;
+constexpr uint32_t TELEMETRY_STALE_MS = 2500;
+constexpr uint32_t TELEMETRY_RECONNECT_MS = 8000;
+constexpr uint32_t DUAL_SAMPLE_MAX_SKEW_MS = 1000;
+constexpr uint32_t COMMAND_ACK_TIMEOUT_MS = 12000;
+constexpr uint8_t REQUIRED_GOOD_PACKETS = 2;
+constexpr uint32_t SCREEN_TIMEOUT_MS = 30000;
+constexpr uint32_t SCREEN_IDLE_WARNING_MS = 3000;
+constexpr int32_t WEIGHT_LOCK_THRESHOLD_GRAMS = 3000;
+constexpr uint32_t WEIGHT_LOCK_SETTLE_MS = 2500;
+constexpr uint32_t WEIGHT_LOCK_SAMPLE_INTERVAL_MS = 500;
+constexpr uint8_t WEIGHT_LOCK_MIN_SAMPLES = 5;
+constexpr uint8_t WEIGHT_LOCK_SAMPLE_CAPACITY = 8;
+// Allow an inclusive 1.00 kg peak-to-peak noise window while settling.
+// For example, samples from 5.50 kg through 6.50 kg may lock; a sample
+// outside that accumulated window restarts the complete settling timer.
+constexpr int32_t WEIGHT_LOCK_NOISE_WINDOW_GRAMS = 1000;
+constexpr uint32_t WEIGHT_LOCK_SYNC_RETRY_MS = 500;
+constexpr uint32_t SCALE_BORDER_SERVICE_INTERVAL_MS = 50;
+constexpr uint32_t SCALE_BORDER_SEARCH_BLINK_MS = 700;
+constexpr uint32_t SCALE_BORDER_ATTENTION_BLINK_MS = 900;
+constexpr uint32_t SCALE_BORDER_ERROR_BLINK_MS = 800;
+
+constexpr uint16_t COLOR_BACKGROUND = 0x0861;
+constexpr uint16_t COLOR_PANEL = 0x10C3;
+constexpr uint16_t COLOR_PANEL_LIGHT = 0x2145;
+constexpr uint16_t COLOR_PRIMARY = 0x051F;
+constexpr uint16_t COLOR_SUCCESS = 0x05E8;
+constexpr uint16_t COLOR_WARNING = 0xFD20;
+constexpr uint16_t COLOR_DANGER = 0xF9C7;
+constexpr uint16_t COLOR_MUTED = 0x9CF3;
+
+struct RemoteScaleDefinition {
+  const char *bluetoothName;
+};
+
+constexpr RemoteScaleDefinition REMOTE_SCALES[] = {
+    {"LOAD_CELL_1"},
+    {"LOAD_CELL_2"},
+};
+constexpr uint8_t REMOTE_SCALE_COUNT =
+    sizeof(REMOTE_SCALES) / sizeof(REMOTE_SCALES[0]);
+static_assert(NIMBLE_MAX_CONNECTIONS >= REMOTE_SCALE_COUNT,
+              "NimBLE must support both load-cell connections.");
+
+TFT_eSPI tft;
+TFT_eSprite weightSprite(&tft);
+Preferences settingsPreferences;
+
+struct TouchSample {
+  uint16_t x = 0;
+  uint16_t y = 0;
+};
+
+enum class Page {
+  Dashboard,
+  Calibration,
+  Settings,
+  Connectivity,
+};
+
+bool touchReady = false;
+bool touchWasDown = false;
+volatile bool screenSleeping = false;
+bool idleWarningActive = false;
+bool backlightPwmReady = false;
+bool settingsPreferencesReady = false;
+bool bluetoothReady = false;
+bool weightValid = false;
+bool pageDirty = true;
+bool uiDirty = true;
+bool weightSpriteReady = false;
+bool dashboardWeightDirty = true;
+bool dashboardLinkDirty = true;
+bool dashboardStatusDirty = true;
+bool dashboardPrimaryActionDirty = true;
+bool dashboardScaleDirty[REMOTE_SCALE_COUNT] = {true, true};
+bool dashboardScaleWeightDirty[REMOTE_SCALE_COUNT] = {true, true};
+uint16_t dashboardScaleBorderDrawnColor[REMOTE_SCALE_COUNT] = {
+    UINT16_MAX,
+    UINT16_MAX,
+};
+uint32_t lastScaleBorderServiceMs = 0;
+
+Page currentPage = Page::Dashboard;
+float latestWeightKg = 0.0f;
+float calibrationWeightKg = 1.0f;
+uint8_t brightnessPercent = DEFAULT_BRIGHTNESS_PERCENT;
+uint8_t calibrationTargetIndex = 0;
+uint16_t cpuFrequencyMhz = DEFAULT_CPU_FREQUENCY_MHZ;
+String noticeMessage;
+
+uint32_t lastTouchActionMs = 0;
+uint32_t lastUserActivityMs = 0;
+uint32_t noticeUntilMs = 0;
+uint32_t lastConnectivityRedrawMs = 0;
+uint8_t idleWarningSecondsShown = 0;
+
+enum class CombinedMode : uint8_t {
+  None,
+  Dual,
+  Scale1Only,
+  Scale2Only,
+};
+
+enum class WeightLockPhase : uint8_t {
+  Unlocked,
+  Settling,
+  Locked,
+};
+
+enum class ScaleBorderMode : uint8_t {
+  Searching,
+  Ready,
+  Attention,
+  Error,
+  Locked,
+  Inactive,
+};
+
+struct WeightSnapshot {
+  CombinedMode mode = CombinedMode::None;
+  int32_t totalGrams = 0;
+  int32_t scaleGrams[REMOTE_SCALE_COUNT] = {};
+  bool scaleIncluded[REMOTE_SCALE_COUNT] = {};
+};
+
+struct ScaleState {
+  bool discovered = false;
+  bool connecting = false;
+  bool connected = false;
+  bool identityVerified = false;
+  bool subscribed = false;
+  bool reconnectRequested = false;
+  uint8_t goodPacketCount = 0;
+  uint8_t flags = 0;
+  uint8_t commandResult =
+      static_cast<uint8_t>(DualScaleBle::CommandResult::None);
+  uint16_t acknowledgedToken = 0;
+  uint16_t pendingToken = 0;
+  uint32_t pendingCommandAtMs = 0;
+  DualScaleBle::CommandType pendingCommand =
+      DualScaleBle::CommandType::Status;
+  DualScaleBle::Status status = DualScaleBle::Status::Starting;
+  int32_t weightGrams = 0;
+  uint32_t sequence = 0;
+  uint32_t connectedAtMs = 0;
+  uint32_t lastTelemetryMs = 0;
+  uint8_t unlockRequestGeneration = 0;
+  uint8_t handledUnlockRequestGeneration = 0;
+  bool unlockRequestHandled = false;
+};
+
+ScaleState scaleStates[REMOTE_SCALE_COUNT];
+CombinedMode combinedMode = CombinedMode::None;
+int32_t latestCombinedGrams = 0;
+WeightLockPhase weightLockPhase = WeightLockPhase::Unlocked;
+WeightSnapshot lockedWeightSnapshot;
+WeightSnapshot weightLockSamples[WEIGHT_LOCK_SAMPLE_CAPACITY];
+uint8_t weightLockSampleCount = 0;
+uint32_t weightLockSettlingStartedMs = 0;
+uint32_t lastWeightLockSampleMs = 0;
+uint32_t lastWeightLockSampleSequence[REMOTE_SCALE_COUNT] = {};
+
+enum class BleManagerMessageType : uint8_t {
+  Discovered,
+  Disconnected,
+  SendCommand,
+  ForceCheck,
+  Reconnect,
+};
+
+struct BleManagerMessage {
+  BleManagerMessageType type = BleManagerMessageType::ForceCheck;
+  uint8_t scaleIndex = 0;
+  uint8_t addressType = 0;
+  uint64_t addressValue = 0;
+  DualScaleBle::CommandPacket command = {};
+};
+
+enum class BleUiEventType : uint8_t {
+  RadioReady,
+  Discovered,
+  Connecting,
+  Connected,
+  Disconnected,
+  Telemetry,
+  CommandWriteFailed,
+};
+
+struct BleUiEvent {
+  BleUiEventType type = BleUiEventType::RadioReady;
+  uint8_t scaleIndex = 0;
+  int reason = 0;
+  DualScaleBle::TelemetryPacket telemetry = {};
+};
+
+struct BleTransportSlot {
+  NimBLEAddress address;
+  bool addressKnown = false;
+  bool connected = false;
+  uint8_t consecutiveConnectFailures = 0;
+  uint32_t nextAttemptMs = 0;
+  NimBLEClient *client = nullptr;
+  NimBLERemoteCharacteristic *telemetryCharacteristic = nullptr;
+  NimBLERemoteCharacteristic *commandCharacteristic = nullptr;
+};
+
+BleTransportSlot bleTransport[REMOTE_SCALE_COUNT];
+QueueHandle_t bleManagerQueue = nullptr;
+QueueHandle_t bleUiQueue = nullptr;
+uint16_t nextCommandToken = 1;
+bool bleForceScanRequested = false;
+bool peerStatusSyncPending[REMOTE_SCALE_COUNT] = {true, true};
+bool weightLockSyncPending[REMOTE_SCALE_COUNT] = {true, true};
+uint32_t weightLockSyncRetryAtMs[REMOTE_SCALE_COUNT] = {};
+
+bool readTouchRegisters(uint8_t firstRegister, uint8_t *buffer, size_t length) {
+  Wire.beginTransmission(CST820_ADDRESS);
+  Wire.write(firstRegister);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  const uint8_t requested = static_cast<uint8_t>(length);
+  const uint8_t received = Wire.requestFrom(CST820_ADDRESS, requested);
+  if (received != requested) {
+    while (Wire.available()) {
+      Wire.read();
+    }
+    return false;
+  }
+
+  for (size_t i = 0; i < length; ++i) {
+    buffer[i] = static_cast<uint8_t>(Wire.read());
+  }
+  return true;
+}
+
+bool writeTouchRegister(uint8_t registerAddress, uint8_t value) {
+  Wire.beginTransmission(CST820_ADDRESS);
+  Wire.write(registerAddress);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool touchControllerPresent() {
+  Wire.beginTransmission(CST820_ADDRESS);
+  return Wire.endTransmission() == 0;
+}
+
+bool beginTouchController() {
+  Wire.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN);
+  Wire.setClock(400000);
+
+  // CST820 wake/reset sequence used by this board.
+  pinMode(TOUCH_INTERRUPT_PIN, OUTPUT);
+  digitalWrite(TOUCH_INTERRUPT_PIN, HIGH);
+  delay(1);
+  digitalWrite(TOUCH_INTERRUPT_PIN, LOW);
+  delay(1);
+
+  pinMode(TOUCH_RESET_PIN, OUTPUT);
+  digitalWrite(TOUCH_RESET_PIN, LOW);
+  delay(10);
+  digitalWrite(TOUCH_RESET_PIN, HIGH);
+  delay(300);
+  pinMode(TOUCH_INTERRUPT_PIN, INPUT_PULLUP);
+
+  if (!touchControllerPresent()) {
+    Serial.println("ERROR: CST820 touch controller not found at 0x15.");
+    return false;
+  }
+
+  // Keep the controller awake.
+  writeTouchRegister(0xFE, 0xFF);
+  Serial.println("CST820 touch controller found at I2C address 0x15.");
+  return true;
+}
+
+bool readTouch(TouchSample &sample) {
+  // Registers 0x01..0x06 contain gesture, point count, X, and Y.
+  uint8_t data[6] = {};
+  if (!readTouchRegisters(0x01, data, sizeof(data))) {
+    return false;
+  }
+
+  if ((data[1] & 0x0F) == 0) {
+    return false;
+  }
+
+  const uint16_t rawX =
+      static_cast<uint16_t>(((data[2] & 0x0F) << 8) | data[3]);
+  const uint16_t rawY =
+      static_cast<uint16_t>(((data[4] & 0x0F) << 8) | data[5]);
+
+  // Rotation 0 is portrait and matches the CST820 axes on this board.
+  sample.x = constrain(rawX, 0, SCREEN_WIDTH - 1);
+  sample.y = constrain(rawY, 0, SCREEN_HEIGHT - 1);
+  return true;
+}
+
+void setCenteredText(const String &text,
+                     int16_t centerX,
+                     int16_t centerY,
+                     uint8_t size,
+                     uint16_t foreground,
+                     uint16_t background) {
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(size);
+  tft.setTextColor(foreground, background);
+  tft.drawString(text, centerX, centerY);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void drawButton(int16_t x,
+                int16_t y,
+                int16_t width,
+                int16_t height,
+                const String &label,
+                uint16_t fill,
+                uint16_t border = TFT_WHITE,
+                uint8_t textSize = 2) {
+  tft.fillRoundRect(x, y, width, height, 7, fill);
+  tft.drawRoundRect(x, y, width, height, 7, border);
+  setCenteredText(label,
+                  x + width / 2,
+                  y + height / 2,
+                  textSize,
+                  TFT_WHITE,
+                  fill);
+}
+
+void beginWeightSprite() {
+  weightSprite.setColorDepth(16);
+  weightSpriteReady =
+      weightSprite.createSprite(WEIGHT_SPRITE_WIDTH,
+                                WEIGHT_SPRITE_HEIGHT) != nullptr;
+  if (weightSpriteReady) {
+    Serial.printf("Weight sprite ready: %d x %d, %lu bytes.\n",
+                  WEIGHT_SPRITE_WIDTH,
+                  WEIGHT_SPRITE_HEIGHT,
+                  static_cast<unsigned long>(WEIGHT_SPRITE_WIDTH) *
+                      WEIGHT_SPRITE_HEIGHT * 2UL);
+  } else {
+    Serial.println(
+        "Warning: weight sprite allocation failed; using direct updates.");
+  }
+}
+
+bool pointInRect(uint16_t x,
+                 uint16_t y,
+                 int16_t left,
+                 int16_t top,
+                 int16_t width,
+                 int16_t height) {
+  return x >= left && x < left + width && y >= top && y < top + height;
+}
+
+uint8_t connectedScaleCount() {
+  uint8_t count = 0;
+  for (const ScaleState &state : scaleStates) {
+    if (state.connected) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+String connectionLabel() {
+  if (!bluetoothReady) {
+    return "BT ERROR";
+  }
+  return String(connectedScaleCount()) + "/2";
+}
+
+uint16_t connectionColor() {
+  const uint8_t count = connectedScaleCount();
+  return count == 2 ? COLOR_SUCCESS
+                    : (bluetoothReady ? COLOR_WARNING : COLOR_DANGER);
+}
+
+bool requiredTelemetryFlagsPresent(const ScaleState &state) {
+  constexpr uint8_t REQUIRED_FLAGS =
+      DualScaleBle::TelemetryFlag::SensorPresent |
+      DualScaleBle::TelemetryFlag::AdcResponding |
+      DualScaleBle::TelemetryFlag::Tared |
+      DualScaleBle::TelemetryFlag::Calibrated |
+      DualScaleBle::TelemetryFlag::WeightValid;
+  return (state.flags & REQUIRED_FLAGS) == REQUIRED_FLAGS;
+}
+
+bool scaleUsable(uint8_t index, uint32_t now = millis()) {
+  const ScaleState &state = scaleStates[index];
+  return state.connected &&
+         state.identityVerified &&
+         state.subscribed &&
+         state.status == DualScaleBle::Status::Ready &&
+         requiredTelemetryFlagsPresent(state) &&
+         state.goodPacketCount >= REQUIRED_GOOD_PACKETS &&
+         state.lastTelemetryMs != 0 &&
+         now - state.lastTelemetryMs <= TELEMETRY_STALE_MS;
+}
+
+void recomputeCombinedWeight() {
+  const uint32_t now = millis();
+  const bool scale1Usable = scaleUsable(0, now);
+  const bool scale2Usable = scaleUsable(1, now);
+
+  CombinedMode newMode = CombinedMode::None;
+  int64_t combinedGrams = 0;
+
+  if (scale1Usable && scale2Usable) {
+    const uint32_t age1 = now - scaleStates[0].lastTelemetryMs;
+    const uint32_t age2 = now - scaleStates[1].lastTelemetryMs;
+    const uint32_t skew = age1 > age2 ? age1 - age2 : age2 - age1;
+    if (skew <= DUAL_SAMPLE_MAX_SKEW_MS) {
+      newMode = CombinedMode::Dual;
+      combinedGrams =
+          static_cast<int64_t>(scaleStates[0].weightGrams) +
+          static_cast<int64_t>(scaleStates[1].weightGrams);
+    } else if (age1 < age2) {
+      newMode = CombinedMode::Scale1Only;
+      combinedGrams = scaleStates[0].weightGrams;
+    } else {
+      newMode = CombinedMode::Scale2Only;
+      combinedGrams = scaleStates[1].weightGrams;
+    }
+  } else if (scale1Usable) {
+    newMode = CombinedMode::Scale1Only;
+    combinedGrams = scaleStates[0].weightGrams;
+  } else if (scale2Usable) {
+    newMode = CombinedMode::Scale2Only;
+    combinedGrams = scaleStates[1].weightGrams;
+  }
+
+  const bool newValid = newMode != CombinedMode::None;
+  const int32_t newCombinedGrams =
+      !newValid
+          ? 0
+          : combinedGrams > INT32_MAX
+                ? INT32_MAX
+                : combinedGrams < INT32_MIN
+                      ? INT32_MIN
+                      : static_cast<int32_t>(combinedGrams);
+  const float newWeightKg =
+      static_cast<float>(newCombinedGrams) / 1000.0f;
+  const bool modeChanged = newMode != combinedMode;
+  const bool validityChanged = newValid != weightValid;
+  const bool weightChanged =
+      newCombinedGrams != latestCombinedGrams;
+  if (modeChanged || validityChanged || weightChanged) {
+    combinedMode = newMode;
+    weightValid = newValid;
+    latestCombinedGrams = newCombinedGrams;
+    latestWeightKg = newWeightKg;
+    if (weightLockPhase != WeightLockPhase::Locked) {
+      dashboardWeightDirty = true;
+    }
+    if (modeChanged || validityChanged) {
+      if (weightLockPhase != WeightLockPhase::Locked) {
+        dashboardStatusDirty = true;
+      }
+      for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+        dashboardScaleDirty[index] = true;
+      }
+    }
+    if (currentPage == Page::Dashboard) {
+      uiDirty = true;
+    }
+  }
+}
+
+bool combinedModeIncludesScale(CombinedMode mode, uint8_t scaleIndex) {
+  return mode == CombinedMode::Dual ||
+         (mode == CombinedMode::Scale1Only && scaleIndex == 0) ||
+         (mode == CombinedMode::Scale2Only && scaleIndex == 1);
+}
+
+WeightSnapshot currentLiveWeightSnapshot() {
+  WeightSnapshot snapshot;
+  if (!weightValid || combinedMode == CombinedMode::None) {
+    return snapshot;
+  }
+
+  snapshot.mode = combinedMode;
+  snapshot.totalGrams = latestCombinedGrams;
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    snapshot.scaleIncluded[index] =
+        combinedModeIncludesScale(combinedMode, index);
+    if (snapshot.scaleIncluded[index]) {
+      snapshot.scaleGrams[index] = scaleStates[index].weightGrams;
+    }
+  }
+  return snapshot;
+}
+
+void markWeightLockUiDirty() {
+  dashboardWeightDirty = true;
+  dashboardStatusDirty = true;
+  dashboardPrimaryActionDirty = true;
+  for (bool &dirty : dashboardScaleDirty) {
+    dirty = true;
+  }
+  if (currentPage == Page::Dashboard) {
+    uiDirty = true;
+  }
+}
+
+void markWeightLockSyncPending() {
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    weightLockSyncPending[index] = true;
+    weightLockSyncRetryAtMs[index] = 0;
+  }
+}
+
+void clearWeightLockSamples() {
+  weightLockSampleCount = 0;
+  weightLockSettlingStartedMs = 0;
+  lastWeightLockSampleMs = 0;
+  for (uint32_t &sequence : lastWeightLockSampleSequence) {
+    sequence = 0;
+  }
+}
+
+void appendWeightLockSample(const WeightSnapshot &snapshot) {
+  if (weightLockSampleCount < WEIGHT_LOCK_SAMPLE_CAPACITY) {
+    weightLockSamples[weightLockSampleCount++] = snapshot;
+    return;
+  }
+
+  for (uint8_t index = 1;
+       index < WEIGHT_LOCK_SAMPLE_CAPACITY;
+       ++index) {
+    weightLockSamples[index - 1] = weightLockSamples[index];
+  }
+  weightLockSamples[WEIGHT_LOCK_SAMPLE_CAPACITY - 1] = snapshot;
+}
+
+WeightSnapshot medianWeightLockSample() {
+  uint8_t order[WEIGHT_LOCK_SAMPLE_CAPACITY] = {};
+  for (uint8_t index = 0; index < weightLockSampleCount; ++index) {
+    order[index] = index;
+  }
+
+  for (uint8_t index = 1; index < weightLockSampleCount; ++index) {
+    const uint8_t selected = order[index];
+    int8_t insertAt = static_cast<int8_t>(index) - 1;
+    while (insertAt >= 0 &&
+           weightLockSamples[order[insertAt]].totalGrams >
+               weightLockSamples[selected].totalGrams) {
+      order[insertAt + 1] = order[insertAt];
+      --insertAt;
+    }
+    order[insertAt + 1] = selected;
+  }
+
+  return weightLockSamples[order[weightLockSampleCount / 2]];
+}
+
+void rememberWeightLockSampleSequences(CombinedMode mode) {
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    if (combinedModeIncludesScale(mode, index)) {
+      lastWeightLockSampleSequence[index] =
+          scaleStates[index].sequence;
+    }
+  }
+}
+
+bool weightLockContributorsHaveFreshTelemetry(CombinedMode mode) {
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    if (combinedModeIncludesScale(mode, index) &&
+        scaleStates[index].sequence ==
+            lastWeightLockSampleSequence[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void beginWeightLockSettling(const WeightSnapshot &firstSample,
+                             const char *reason) {
+  clearWeightLockSamples();
+  weightLockPhase = WeightLockPhase::Settling;
+  weightLockSettlingStartedMs = millis();
+  lastWeightLockSampleMs = millis();
+  appendWeightLockSample(firstSample);
+  rememberWeightLockSampleSequences(firstSample.mode);
+  dashboardStatusDirty = true;
+  if (currentPage == Page::Dashboard) {
+    uiDirty = true;
+  }
+  Serial.print("Weight lock settling started");
+  if (reason != nullptr && reason[0] != '\0') {
+    Serial.print(" (");
+    Serial.print(reason);
+    Serial.print(")");
+  }
+  Serial.println(".");
+}
+
+void unlockCombinedWeight(const char *reason) {
+  const bool stateWasVisible =
+      weightLockPhase != WeightLockPhase::Unlocked;
+  weightLockPhase = WeightLockPhase::Unlocked;
+  clearWeightLockSamples();
+  markWeightLockSyncPending();
+  if (stateWasVisible) {
+    markWeightLockUiDirty();
+  } else {
+    dashboardStatusDirty = true;
+    if (currentPage == Page::Dashboard) {
+      uiDirty = true;
+    }
+  }
+
+  Serial.print("Combined weight unlocked and re-armed");
+  if (reason != nullptr && reason[0] != '\0') {
+    Serial.print(" (");
+    Serial.print(reason);
+    Serial.print(")");
+  }
+  Serial.println(".");
+}
+
+void lockCombinedWeight(const WeightSnapshot &snapshot) {
+  lockedWeightSnapshot = snapshot;
+  weightLockPhase = WeightLockPhase::Locked;
+  clearWeightLockSamples();
+  markWeightLockSyncPending();
+  markWeightLockUiDirty();
+  Serial.printf("Combined weight LOCKED at %.2f kg (%s).\n",
+                static_cast<float>(snapshot.totalGrams) / 1000.0f,
+                snapshot.mode == CombinedMode::Dual
+                    ? "A+B"
+                    : snapshot.mode == CombinedMode::Scale1Only
+                          ? "A only"
+                          : "B only");
+}
+
+bool scaleOperationCommandPending() {
+  for (const ScaleState &state : scaleStates) {
+    if (state.pendingToken != 0 &&
+        (state.pendingCommand == DualScaleBle::CommandType::Tare ||
+         state.pendingCommand ==
+             DualScaleBle::CommandType::Calibrate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool weightLockContributorsReadyToArm() {
+  constexpr uint8_t BLOCKING_FLAGS =
+      DualScaleBle::TelemetryFlag::WeightLocked |
+      DualScaleBle::TelemetryFlag::UnlockRequested;
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    if (combinedModeIncludesScale(combinedMode, index) &&
+        (scaleStates[index].flags & BLOCKING_FLAGS) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void serviceAutomaticWeightLock() {
+  if (weightLockPhase == WeightLockPhase::Locked) {
+    return;
+  }
+
+  const bool eligible =
+      weightValid &&
+      combinedMode != CombinedMode::None &&
+      latestCombinedGrams > WEIGHT_LOCK_THRESHOLD_GRAMS &&
+      !scaleOperationCommandPending() &&
+      weightLockContributorsReadyToArm();
+  if (!eligible) {
+    if (weightLockPhase == WeightLockPhase::Settling) {
+      weightLockPhase = WeightLockPhase::Unlocked;
+      clearWeightLockSamples();
+      dashboardStatusDirty = true;
+      if (currentPage == Page::Dashboard) {
+        uiDirty = true;
+      }
+      Serial.println(
+          "Weight lock settling cancelled: eligibility was lost.");
+    }
+    return;
+  }
+
+  const WeightSnapshot liveSnapshot = currentLiveWeightSnapshot();
+  if (weightLockPhase == WeightLockPhase::Unlocked) {
+    beginWeightLockSettling(liveSnapshot, "weight above 3 kg");
+    return;
+  }
+
+  if (weightLockSampleCount == 0 ||
+      liveSnapshot.mode != weightLockSamples[0].mode) {
+    beginWeightLockSettling(liveSnapshot, "contributing scales changed");
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastWeightLockSampleMs <
+      WEIGHT_LOCK_SAMPLE_INTERVAL_MS) {
+    return;
+  }
+  if (!weightLockContributorsHaveFreshTelemetry(liveSnapshot.mode)) {
+    return;
+  }
+  lastWeightLockSampleMs = now;
+  rememberWeightLockSampleSequences(liveSnapshot.mode);
+
+  int32_t minimumGrams = liveSnapshot.totalGrams;
+  int32_t maximumGrams = liveSnapshot.totalGrams;
+  for (uint8_t index = 0; index < weightLockSampleCount; ++index) {
+    minimumGrams =
+        min(minimumGrams, weightLockSamples[index].totalGrams);
+    maximumGrams =
+        max(maximumGrams, weightLockSamples[index].totalGrams);
+  }
+
+  const int64_t candidateRangeGrams =
+      static_cast<int64_t>(maximumGrams) - minimumGrams;
+  if (candidateRangeGrams > WEIGHT_LOCK_NOISE_WINDOW_GRAMS) {
+    beginWeightLockSettling(liveSnapshot,
+                            "noise exceeded 1 kg window");
+    return;
+  }
+
+  appendWeightLockSample(liveSnapshot);
+  if (now - weightLockSettlingStartedMs < WEIGHT_LOCK_SETTLE_MS ||
+      weightLockSampleCount < WEIGHT_LOCK_MIN_SAMPLES) {
+    return;
+  }
+
+  const WeightSnapshot lockedSample = medianWeightLockSample();
+  lockCombinedWeight(lockedSample);
+}
+
+bool noticeActive() {
+  return !noticeMessage.isEmpty() &&
+         static_cast<int32_t>(noticeUntilMs - millis()) > 0;
+}
+
+void showNotice(const String &message, uint32_t durationMs = 2500) {
+  noticeMessage = message;
+  noticeUntilMs = millis() + durationMs;
+  dashboardStatusDirty = true;
+  uiDirty = true;
+}
+
+void markConnectionUiDirty(int8_t scaleIndex = -1) {
+  dashboardLinkDirty = true;
+  dashboardStatusDirty = true;
+  if (scaleIndex >= 0 && scaleIndex < REMOTE_SCALE_COUNT) {
+    dashboardScaleDirty[scaleIndex] = true;
+  } else {
+    for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+      dashboardScaleDirty[index] = true;
+    }
+  }
+  // Calibration controls also depend on each scale's live connection state.
+  if (currentPage != Page::Settings) {
+    uiDirty = true;
+  }
+}
+
+void changePage(Page page) {
+  if (currentPage == page) {
+    return;
+  }
+  currentPage = page;
+  pageDirty = true;
+  uiDirty = true;
+}
+
+bool supportedCpuFrequency(uint16_t frequencyMhz) {
+  return frequencyMhz == 160 || frequencyMhz == 240;
+}
+
+uint8_t brightnessDutyCycle() {
+  return static_cast<uint8_t>(
+      (static_cast<uint16_t>(brightnessPercent) * 255U + 50U) / 100U);
+}
+
+void applyBacklightOutput(bool enabled) {
+  const uint8_t duty = enabled ? brightnessDutyCycle() : 0;
+  if (backlightPwmReady) {
+    ledcWrite(BACKLIGHT_PWM_CHANNEL, duty);
+  } else {
+    digitalWrite(TFT_BACKLIGHT_PIN, enabled ? HIGH : LOW);
+  }
+}
+
+void beginBacklightControl() {
+  const uint32_t actualFrequency =
+      ledcSetup(BACKLIGHT_PWM_CHANNEL,
+                BACKLIGHT_PWM_FREQUENCY_HZ,
+                BACKLIGHT_PWM_RESOLUTION_BITS);
+  if (actualFrequency == 0) {
+    Serial.println("Warning: backlight PWM setup failed; using on/off control.");
+    return;
+  }
+
+  ledcAttachPin(TFT_BACKLIGHT_PIN, BACKLIGHT_PWM_CHANNEL);
+  backlightPwmReady = true;
+  ledcWrite(BACKLIGHT_PWM_CHANNEL, 0);
+}
+
+void loadDisplaySettings() {
+  settingsPreferencesReady =
+      settingsPreferences.begin(SETTINGS_NAMESPACE, false);
+  if (!settingsPreferencesReady) {
+    Serial.println("Warning: display settings storage is unavailable.");
+  } else {
+    brightnessPercent =
+        settingsPreferences.getUChar(BRIGHTNESS_KEY,
+                                     DEFAULT_BRIGHTNESS_PERCENT);
+    brightnessPercent = static_cast<uint8_t>(
+        constrain(static_cast<int>(brightnessPercent),
+                  static_cast<int>(MIN_BRIGHTNESS_PERCENT),
+                  static_cast<int>(MAX_BRIGHTNESS_PERCENT)));
+
+    const uint16_t storedCpuFrequency =
+        settingsPreferences.getUShort(CPU_FREQUENCY_KEY,
+                                      DEFAULT_CPU_FREQUENCY_MHZ);
+    cpuFrequencyMhz = supportedCpuFrequency(storedCpuFrequency)
+                          ? storedCpuFrequency
+                          : DEFAULT_CPU_FREQUENCY_MHZ;
+
+  }
+
+  if (!setCpuFrequencyMhz(cpuFrequencyMhz)) {
+    Serial.println("Warning: saved CPU frequency could not be applied.");
+  }
+  cpuFrequencyMhz = static_cast<uint16_t>(getCpuFrequencyMhz());
+
+  Serial.printf("Display brightness: %u%%\n", brightnessPercent);
+  Serial.printf("CPU frequency: %u MHz\n", cpuFrequencyMhz);
+}
+
+void adjustBrightness(int amountPercent) {
+  const int adjustedPercent =
+      constrain(static_cast<int>(brightnessPercent) + amountPercent,
+                static_cast<int>(MIN_BRIGHTNESS_PERCENT),
+                static_cast<int>(MAX_BRIGHTNESS_PERCENT));
+  if (adjustedPercent == brightnessPercent) {
+    return;
+  }
+
+  brightnessPercent = static_cast<uint8_t>(adjustedPercent);
+  applyBacklightOutput(!screenSleeping);
+  if (settingsPreferencesReady) {
+    settingsPreferences.putUChar(BRIGHTNESS_KEY, brightnessPercent);
+  }
+  Serial.printf("Display brightness changed to %u%%.\n", brightnessPercent);
+  uiDirty = true;
+}
+
+void selectCpuFrequency(uint16_t requestedFrequencyMhz) {
+  if (!supportedCpuFrequency(requestedFrequencyMhz) ||
+      requestedFrequencyMhz == cpuFrequencyMhz) {
+    return;
+  }
+
+  if (!setCpuFrequencyMhz(requestedFrequencyMhz)) {
+    Serial.printf("ERROR: Could not set CPU frequency to %u MHz.\n",
+                  requestedFrequencyMhz);
+    showNotice("CPU clock change failed", 4000);
+    return;
+  }
+
+  cpuFrequencyMhz = static_cast<uint16_t>(getCpuFrequencyMhz());
+  if (settingsPreferencesReady) {
+    settingsPreferences.putUShort(CPU_FREQUENCY_KEY, cpuFrequencyMhz);
+  }
+  Serial.printf("CPU frequency changed to %u MHz.\n", cpuFrequencyMhz);
+  uiDirty = true;
+}
+
+void drawHeader(const String &title,
+                bool backButton,
+                bool dashboardButtons = false) {
+  tft.fillRect(0, 0, SCREEN_WIDTH, 42, COLOR_PANEL);
+
+  if (backButton) {
+    drawButton(5, 7, 55, 28, "BACK", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
+    tft.setTextColor(TFT_WHITE, COLOR_PANEL);
+    tft.setTextSize(2);
+    tft.setCursor(70, 12);
+    tft.print(title);
+  } else {
+    tft.setTextColor(TFT_WHITE, COLOR_PANEL);
+    tft.setTextSize(2);
+    tft.setCursor(8, 12);
+    tft.print(title);
+
+    if (dashboardButtons) {
+      drawButton(123,
+                 7,
+                 51,
+                 28,
+                 "LINK",
+                 COLOR_PANEL_LIGHT,
+                 connectionColor(),
+                 1);
+      drawButton(181,
+                 7,
+                 54,
+                 28,
+                 "SET",
+                 COLOR_PANEL_LIGHT,
+                 COLOR_MUTED,
+                 1);
+    } else {
+      const uint16_t color = connectionColor();
+      tft.fillCircle(153, 21, 5, color);
+      tft.setTextColor(color, COLOR_PANEL);
+      tft.setTextSize(1);
+      tft.setCursor(163, 17);
+      tft.print(connectionLabel());
+    }
+  }
+}
+
+String dashboardScaleStatus(uint8_t index) {
+  const ScaleState &state = scaleStates[index];
+  if (weightLockPhase == WeightLockPhase::Locked &&
+      !combinedModeIncludesScale(lockedWeightSnapshot.mode, index)) {
+    return "NOT IN LOCK";
+  }
+  if (!bluetoothReady) {
+    return "BT ERROR";
+  }
+  if (!state.connected) {
+    return state.connecting ? "CONNECTING"
+                            : (state.discovered ? "RETRYING" : "SEARCHING");
+  }
+  if (state.status == DualScaleBle::Status::NoSensor) {
+    return "NO SENSOR";
+  }
+  if (state.status == DualScaleBle::Status::SensorError) {
+    return "ADC ERROR";
+  }
+  if (state.status == DualScaleBle::Status::Taring) {
+    return "TARING";
+  }
+  if (state.status == DualScaleBle::Status::Calibrating) {
+    return "CALIBRATING";
+  }
+  if (state.status == DualScaleBle::Status::NeedsTare) {
+    return "NEEDS TARE";
+  }
+  if (state.status == DualScaleBle::Status::NeedsCalibration) {
+    return "NEEDS CAL";
+  }
+  if (state.status == DualScaleBle::Status::ShuttingDown) {
+    return "SHUTDOWN";
+  }
+  if (!state.identityVerified || !state.subscribed ||
+      state.lastTelemetryMs == 0) {
+    return "SYNCING";
+  }
+  if (millis() - state.lastTelemetryMs > TELEMETRY_STALE_MS) {
+    return "STALE DATA";
+  }
+  if (weightLockPhase == WeightLockPhase::Locked) {
+    return "LOCKED";
+  }
+  if (state.goodPacketCount < REQUIRED_GOOD_PACKETS) {
+    return "STABILIZING";
+  }
+  return scaleUsable(index) ? "READY" : "NOT READY";
+}
+
+uint16_t dashboardScaleColor(uint8_t index) {
+  const String status = dashboardScaleStatus(index);
+  if (status == "READY" || status == "LOCKED") {
+    return COLOR_SUCCESS;
+  }
+  if (status == "BT ERROR" || status == "NO SENSOR" ||
+      status == "ADC ERROR" || status == "STALE DATA") {
+    return COLOR_DANGER;
+  }
+  return COLOR_WARNING;
+}
+
+uint16_t blendRgb565(uint16_t foreground,
+                     uint16_t background,
+                     uint8_t foregroundWeight) {
+  const uint16_t backgroundWeight = 255U - foregroundWeight;
+  const uint16_t foregroundRed = (foreground >> 11) & 0x1F;
+  const uint16_t foregroundGreen = (foreground >> 5) & 0x3F;
+  const uint16_t foregroundBlue = foreground & 0x1F;
+  const uint16_t backgroundRed = (background >> 11) & 0x1F;
+  const uint16_t backgroundGreen = (background >> 5) & 0x3F;
+  const uint16_t backgroundBlue = background & 0x1F;
+
+  const uint16_t red =
+      (foregroundRed * foregroundWeight +
+       backgroundRed * backgroundWeight + 127U) /
+      255U;
+  const uint16_t green =
+      (foregroundGreen * foregroundWeight +
+       backgroundGreen * backgroundWeight + 127U) /
+      255U;
+  const uint16_t blue =
+      (foregroundBlue * foregroundWeight +
+       backgroundBlue * backgroundWeight + 127U) /
+      255U;
+  return static_cast<uint16_t>((red << 11) | (green << 5) | blue);
+}
+
+ScaleBorderMode dashboardScaleBorderMode(uint8_t index) {
+  const ScaleState &state = scaleStates[index];
+
+  // A scale that did not contribute to the held result stays visually muted.
+  if (weightLockPhase == WeightLockPhase::Locked &&
+      !combinedModeIncludesScale(lockedWeightSnapshot.mode, index)) {
+    return ScaleBorderMode::Inactive;
+  }
+  if (!bluetoothReady) {
+    return ScaleBorderMode::Error;
+  }
+  if (!state.connected) {
+    return ScaleBorderMode::Searching;
+  }
+  if (state.status == DualScaleBle::Status::NoSensor ||
+      state.status == DualScaleBle::Status::SensorError) {
+    return ScaleBorderMode::Error;
+  }
+  if (state.identityVerified && state.lastTelemetryMs != 0) {
+    constexpr uint8_t SENSOR_HEALTH_FLAGS =
+        DualScaleBle::TelemetryFlag::SensorPresent |
+        DualScaleBle::TelemetryFlag::AdcResponding;
+    if ((state.flags & SENSOR_HEALTH_FLAGS) != SENSOR_HEALTH_FLAGS ||
+        millis() - state.lastTelemetryMs > TELEMETRY_STALE_MS) {
+      return ScaleBorderMode::Error;
+    }
+  }
+  if (state.status == DualScaleBle::Status::ShuttingDown) {
+    return ScaleBorderMode::Inactive;
+  }
+  if (!state.identityVerified || !state.subscribed ||
+      state.lastTelemetryMs == 0) {
+    return ScaleBorderMode::Searching;
+  }
+  if (state.status == DualScaleBle::Status::NeedsTare ||
+      state.status == DualScaleBle::Status::NeedsCalibration ||
+      state.status == DualScaleBle::Status::Taring ||
+      state.status == DualScaleBle::Status::Calibrating) {
+    return ScaleBorderMode::Attention;
+  }
+  if (state.identityVerified && state.lastTelemetryMs != 0 &&
+      ((state.flags & DualScaleBle::TelemetryFlag::Tared) == 0 ||
+       (state.flags & DualScaleBle::TelemetryFlag::Calibrated) == 0)) {
+    return ScaleBorderMode::Attention;
+  }
+  if (weightLockPhase == WeightLockPhase::Locked) {
+    return ScaleBorderMode::Locked;
+  }
+  return scaleUsable(index) ? ScaleBorderMode::Ready
+                            : ScaleBorderMode::Searching;
+}
+
+uint16_t animatedScaleBorderColor(uint16_t brightColor,
+                                  uint32_t phaseDurationMs) {
+  const bool brightPhase =
+      ((millis() / phaseDurationMs) & 1U) == 0;
+  return brightPhase
+             ? brightColor
+             : blendRgb565(brightColor, COLOR_PANEL, 72);
+}
+
+uint16_t dashboardScaleBorderColor(uint8_t index) {
+  switch (dashboardScaleBorderMode(index)) {
+  case ScaleBorderMode::Ready:
+    return COLOR_SUCCESS;
+  case ScaleBorderMode::Attention:
+    return animatedScaleBorderColor(
+        COLOR_WARNING, SCALE_BORDER_ATTENTION_BLINK_MS);
+  case ScaleBorderMode::Error:
+    return animatedScaleBorderColor(
+        COLOR_DANGER, SCALE_BORDER_ERROR_BLINK_MS);
+  case ScaleBorderMode::Locked:
+    return COLOR_PRIMARY;
+  case ScaleBorderMode::Inactive:
+    return COLOR_MUTED;
+  case ScaleBorderMode::Searching:
+  default:
+    return animatedScaleBorderColor(
+        COLOR_WARNING, SCALE_BORDER_SEARCH_BLINK_MS);
+  }
+}
+
+void drawDashboardScaleBorder(uint8_t index, bool force = false) {
+  const uint16_t color = dashboardScaleBorderColor(index);
+  if (!force && dashboardScaleBorderDrawnColor[index] == color) {
+    return;
+  }
+
+  tft.drawRoundRect(6,
+                    DASHBOARD_SCALE_PANEL_Y[index],
+                    228,
+                    61,
+                    8,
+                    color);
+  dashboardScaleBorderDrawnColor[index] = color;
+}
+
+void serviceDashboardScaleBorderAnimation() {
+  if (currentPage != Page::Dashboard || screenSleeping ||
+      idleWarningActive) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastScaleBorderServiceMs <
+      SCALE_BORDER_SERVICE_INTERVAL_MS) {
+    return;
+  }
+  lastScaleBorderServiceMs = now;
+
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    drawDashboardScaleBorder(index);
+  }
+}
+
+void drawWeightValue(float weightKg,
+                     bool valid,
+                     int16_t x,
+                     int16_t y,
+                     bool largeText) {
+  char weightText[20];
+  const uint16_t textColor = valid ? TFT_WHITE : COLOR_MUTED;
+  if (valid) {
+    snprintf(weightText, sizeof(weightText), "%.2f", weightKg);
+  } else {
+    snprintf(weightText, sizeof(weightText), "--.--");
+  }
+
+  const uint8_t textSize = largeText && strlen(weightText) <= 6 ? 3 : 2;
+  if (weightSpriteReady) {
+    weightSprite.fillSprite(COLOR_PANEL);
+    weightSprite.setTextDatum(MR_DATUM);
+    weightSprite.setTextSize(textSize);
+    weightSprite.setTextColor(textColor, COLOR_PANEL);
+    weightSprite.drawString(weightText, 112, WEIGHT_SPRITE_HEIGHT / 2);
+    weightSprite.setTextDatum(ML_DATUM);
+    weightSprite.setTextSize(1);
+    weightSprite.drawString("kg", 120, WEIGHT_SPRITE_HEIGHT / 2);
+    weightSprite.setTextDatum(TL_DATUM);
+    weightSprite.pushSprite(x, y);
+    return;
+  }
+
+  // Safe fallback if heap allocation for the sprite ever fails.
+  tft.fillRect(x,
+               y,
+               WEIGHT_SPRITE_WIDTH,
+               WEIGHT_SPRITE_HEIGHT,
+               COLOR_PANEL);
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextSize(textSize);
+  tft.setTextColor(textColor, COLOR_PANEL);
+  tft.drawString(weightText, x + 112, y + WEIGHT_SPRITE_HEIGHT / 2);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("kg", x + 120, y + WEIGHT_SPRITE_HEIGHT / 2);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void drawDashboardScaleWeight(uint8_t index, int16_t weightY) {
+  const bool globalLockActive =
+      weightLockPhase == WeightLockPhase::Locked;
+  const bool locked =
+      globalLockActive &&
+      lockedWeightSnapshot.scaleIncluded[index];
+  // A scale that was not a contributor when the snapshot locked is shown as
+  // unavailable, not as a changing live value that would no longer add up to
+  // the frozen total.
+  const bool valid = locked || (!globalLockActive && scaleUsable(index));
+  const float weightKg =
+      locked
+          ? static_cast<float>(
+                lockedWeightSnapshot.scaleGrams[index]) /
+                1000.0f
+          : valid
+                ? static_cast<float>(
+                      scaleStates[index].weightGrams) /
+                      1000.0f
+                : 0.0f;
+  drawWeightValue(weightKg, valid, DASHBOARD_WEIGHT_X, weightY, false);
+}
+
+void drawDashboardScale(uint8_t index, int16_t panelY, int16_t weightY) {
+  const String status = dashboardScaleStatus(index);
+  const uint16_t statusColor = dashboardScaleColor(index);
+
+  tft.fillRect(12, panelY + 30, 68, 16, COLOR_PANEL);
+  tft.setTextColor(statusColor, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setCursor(14, panelY + 34);
+  tft.print(status);
+  drawDashboardScaleBorder(index, true);
+  drawDashboardScaleWeight(index, weightY);
+}
+
+void drawDashboardStatus() {
+  String statusLine;
+  uint16_t statusColor = TFT_WHITE;
+  if (weightLockPhase == WeightLockPhase::Locked) {
+    statusLine = "WEIGHT LOCKED - TAP UNLOCK";
+    statusColor = COLOR_SUCCESS;
+  } else if (weightLockPhase == WeightLockPhase::Settling) {
+    statusLine = "HOLD STILL - LOCKING...";
+    statusColor = COLOR_WARNING;
+  } else if (noticeActive()) {
+    statusLine = noticeMessage;
+    statusColor = COLOR_WARNING;
+  } else if (combinedMode == CombinedMode::Dual) {
+    statusLine = "A + B COMBINED";
+    statusColor = COLOR_SUCCESS;
+  } else if (combinedMode == CombinedMode::Scale1Only) {
+    statusLine = "PARTIAL: LOAD CELL A";
+    statusColor = COLOR_WARNING;
+  } else if (combinedMode == CombinedMode::Scale2Only) {
+    statusLine = "PARTIAL: LOAD CELL B";
+    statusColor = COLOR_WARNING;
+  } else {
+    statusLine = bluetoothReady
+                     ? "WAITING FOR VALID DATA"
+                     : "BLE RADIO ERROR";
+    statusColor = connectedScaleCount() == 0 ? COLOR_DANGER : COLOR_WARNING;
+  }
+
+  tft.fillRect(12, 229, 216, 15, COLOR_PANEL);
+  tft.setTextColor(statusColor, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setCursor(14, 233);
+  tft.print(statusLine);
+  tft.drawRoundRect(6, 177, 228, 72, 8, statusColor);
+}
+
+void drawDashboardPrimaryAction() {
+  const bool locked = weightLockPhase == WeightLockPhase::Locked;
+  drawButton(6,
+             256,
+             108,
+             56,
+             locked ? "UNLOCK" : "TARE ALL",
+             locked ? COLOR_WARNING : COLOR_PRIMARY,
+             locked ? COLOR_WARNING : COLOR_PRIMARY,
+             2);
+}
+
+void drawDashboardDynamic(bool force = false) {
+  // Each live region is independent. Weight packets only push the sprite;
+  // unchanged connection and status areas are left completely untouched.
+  if (force || dashboardLinkDirty) {
+    tft.drawRoundRect(123, 7, 51, 28, 7, connectionColor());
+    dashboardLinkDirty = false;
+  }
+
+  if (force || dashboardScaleDirty[0]) {
+    drawDashboardScale(0, 47, DASHBOARD_SCALE_A_WEIGHT_Y);
+    dashboardScaleDirty[0] = false;
+    dashboardScaleWeightDirty[0] = false;
+  } else if (dashboardScaleWeightDirty[0]) {
+    drawDashboardScaleWeight(0, DASHBOARD_SCALE_A_WEIGHT_Y);
+    dashboardScaleWeightDirty[0] = false;
+  }
+
+  if (force || dashboardScaleDirty[1]) {
+    drawDashboardScale(1, 112, DASHBOARD_SCALE_B_WEIGHT_Y);
+    dashboardScaleDirty[1] = false;
+    dashboardScaleWeightDirty[1] = false;
+  } else if (dashboardScaleWeightDirty[1]) {
+    drawDashboardScaleWeight(1, DASHBOARD_SCALE_B_WEIGHT_Y);
+    dashboardScaleWeightDirty[1] = false;
+  }
+
+  if (force || dashboardWeightDirty) {
+    const bool locked =
+        weightLockPhase == WeightLockPhase::Locked;
+    const float displayedWeightKg =
+        locked
+            ? static_cast<float>(
+                  lockedWeightSnapshot.totalGrams) /
+                  1000.0f
+            : latestWeightKg;
+    drawWeightValue(displayedWeightKg,
+                    locked || weightValid,
+                    DASHBOARD_WEIGHT_X,
+                    DASHBOARD_TOTAL_WEIGHT_Y,
+                    true);
+    dashboardWeightDirty = false;
+  }
+
+  if (force || dashboardStatusDirty) {
+    drawDashboardStatus();
+    dashboardStatusDirty = false;
+  }
+
+  if (force || dashboardPrimaryActionDirty) {
+    drawDashboardPrimaryAction();
+    dashboardPrimaryActionDirty = false;
+  }
+}
+
+void drawDashboard() {
+  tft.fillScreen(COLOR_BACKGROUND);
+  drawHeader("LOAD CELL", false, true);
+
+  tft.fillRoundRect(6, 47, 228, 61, 8, COLOR_PANEL);
+  tft.fillRoundRect(6, 112, 228, 61, 8, COLOR_PANEL);
+  tft.fillRoundRect(6, 177, 228, 72, 8, COLOR_PANEL);
+  tft.setTextColor(TFT_WHITE, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setCursor(14, 54);
+  tft.print("LOAD CELL A");
+  tft.setCursor(14, 119);
+  tft.print("LOAD CELL B");
+  tft.setCursor(14, 184);
+  tft.print("TOTAL");
+
+  drawButton(126,
+             256,
+             108,
+             56,
+             "CALIBRATE",
+             COLOR_PANEL_LIGHT,
+             COLOR_WARNING,
+             1);
+
+  drawDashboardDynamic(true);
+
+  if (!touchReady) {
+    tft.fillRect(0, 311, SCREEN_WIDTH, 9, COLOR_DANGER);
+    setCenteredText("TOUCH NOT FOUND", 120, 315, 1, TFT_WHITE, COLOR_DANGER);
+  }
+}
+
+void drawCalibrationDynamic() {
+  tft.fillRoundRect(6, 84, 228, 72, 9, COLOR_PANEL);
+  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setCursor(16, 94);
+  tft.print("KNOWN WEIGHT - SCALE ");
+  tft.print(calibrationTargetIndex + 1);
+
+  char knownWeightText[24];
+  snprintf(knownWeightText,
+           sizeof(knownWeightText),
+           "%.1f kg",
+           calibrationWeightKg);
+  setCenteredText(knownWeightText, 120, 130, 3, TFT_WHITE, COLOR_PANEL);
+
+  drawButton(6,
+             158,
+             111,
+             30,
+             "SCALE 1",
+             calibrationTargetIndex == 0 ? COLOR_PRIMARY : COLOR_PANEL_LIGHT,
+             calibrationTargetIndex == 0 ? COLOR_PRIMARY : COLOR_MUTED,
+             1);
+  drawButton(123,
+             158,
+             111,
+             30,
+             "SCALE 2",
+             calibrationTargetIndex == 1 ? COLOR_PRIMARY : COLOR_PANEL_LIGHT,
+             calibrationTargetIndex == 1 ? COLOR_PRIMARY : COLOR_MUTED,
+             1);
+
+  drawButton(6,
+             232,
+             228,
+             36,
+             "TARE SCALE " + String(calibrationTargetIndex + 1),
+             COLOR_PANEL_LIGHT,
+             COLOR_PRIMARY,
+             1);
+  drawButton(6,
+             276,
+             228,
+             37,
+             "CALIBRATE SCALE " + String(calibrationTargetIndex + 1),
+             COLOR_PRIMARY,
+             COLOR_PRIMARY,
+             1);
+
+  tft.fillRect(6, 268, 228, 8, COLOR_BACKGROUND);
+  if (noticeActive()) {
+    setCenteredText(noticeMessage,
+                    120,
+                    272,
+                    1,
+                    COLOR_WARNING,
+                    COLOR_BACKGROUND);
+  }
+}
+
+void drawCalibrationPage() {
+  tft.fillScreen(COLOR_BACKGROUND);
+  drawHeader("CALIBRATE", true);
+
+  tft.setTextColor(COLOR_MUTED, COLOR_BACKGROUND);
+  tft.setTextSize(1);
+  tft.setCursor(8, 50);
+  tft.println("1. Select a scale and tare it empty");
+  tft.setCursor(8, 65);
+  tft.println("2. Load selected cell only, then CAL");
+
+  drawButton(4, 194, 55, 32, "-1", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
+  drawButton(63, 194, 55, 32, "-0.1", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
+  drawButton(122, 194, 55, 32, "+0.1", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
+  drawButton(181, 194, 55, 32, "+1", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
+
+  drawCalibrationDynamic();
+}
+
+void drawSettingsDynamic() {
+  tft.fillRect(20, 75, 200, 33, COLOR_PANEL);
+  setCenteredText(String(brightnessPercent) + "%",
+                  SCREEN_WIDTH / 2,
+                  91,
+                  3,
+                  TFT_WHITE,
+                  COLOR_PANEL);
+
+  tft.fillRect(20, 191, 200, 33, COLOR_PANEL);
+  setCenteredText(String(cpuFrequencyMhz) + " MHz",
+                  SCREEN_WIDTH / 2,
+                  207,
+                  2,
+                  TFT_WHITE,
+                  COLOR_PANEL);
+
+  drawButton(12,
+             230,
+             102,
+             40,
+             "160 MHz",
+             cpuFrequencyMhz == 160 ? COLOR_PRIMARY : COLOR_PANEL_LIGHT,
+             cpuFrequencyMhz == 160 ? COLOR_PRIMARY : COLOR_MUTED,
+             1);
+  drawButton(126,
+             230,
+             102,
+             40,
+             "240 MHz",
+             cpuFrequencyMhz == 240 ? COLOR_PRIMARY : COLOR_PANEL_LIGHT,
+             cpuFrequencyMhz == 240 ? COLOR_PRIMARY : COLOR_MUTED,
+             1);
+
+  tft.fillRect(0, 283, SCREEN_WIDTH, 37, COLOR_BACKGROUND);
+  const String footerText =
+      noticeActive() ? noticeMessage : "Settings save automatically";
+  setCenteredText(footerText,
+                  SCREEN_WIDTH / 2,
+                  295,
+                  1,
+                  noticeActive() ? COLOR_WARNING : COLOR_MUTED,
+                  COLOR_BACKGROUND);
+  setCenteredText("Lower settings can reduce heat",
+                  SCREEN_WIDTH / 2,
+                  311,
+                  1,
+                  COLOR_MUTED,
+                  COLOR_BACKGROUND);
+}
+
+void drawSettingsPage() {
+  tft.fillScreen(COLOR_BACKGROUND);
+  drawHeader("SETTINGS", true);
+
+  tft.fillRoundRect(6, 51, 228, 106, 9, COLOR_PANEL);
+  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setCursor(16, 61);
+  tft.print("DISPLAY BRIGHTNESS");
+  drawButton(12,
+             116,
+             92,
+             34,
+             "-10%",
+             COLOR_PANEL_LIGHT,
+             COLOR_MUTED,
+             1);
+  drawButton(136,
+             116,
+             92,
+             34,
+             "+10%",
+             COLOR_PANEL_LIGHT,
+             COLOR_MUTED,
+             1);
+
+  tft.fillRoundRect(6, 167, 228, 113, 9, COLOR_PANEL);
+  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setCursor(16, 177);
+  tft.print("ESP32 CPU CLOCK");
+
+  drawSettingsDynamic();
+}
+
+String scaleLinkLabel(uint8_t index) {
+  const ScaleState &state = scaleStates[index];
+  if (!bluetoothReady) {
+    return "BT ERROR";
+  }
+  if (state.connected) {
+    return state.identityVerified ? "CONNECTED" : "VERIFYING";
+  }
+  if (state.connecting) {
+    return "CONNECTING";
+  }
+  return state.discovered ? "RETRYING" : "SEARCHING";
+}
+
+uint16_t scaleLinkColor(uint8_t index) {
+  const ScaleState &state = scaleStates[index];
+  if (state.connected && state.identityVerified) {
+    return COLOR_SUCCESS;
+  }
+  if (bluetoothReady && (state.connecting || state.discovered)) {
+    return COLOR_WARNING;
+  }
+  return COLOR_DANGER;
+}
+
+String scaleAdcLabel(uint8_t index) {
+  const ScaleState &state = scaleStates[index];
+  if (!state.connected || state.lastTelemetryMs == 0) {
+    return "UNKNOWN";
+  }
+  if (state.status == DualScaleBle::Status::NoSensor ||
+      !(state.flags & DualScaleBle::SensorPresent)) {
+    return "NOT FOUND";
+  }
+  if (state.status == DualScaleBle::Status::SensorError ||
+      !(state.flags & DualScaleBle::AdcResponding)) {
+    return "READ ERROR";
+  }
+  return "CONNECTED";
+}
+
+uint16_t scaleAdcColor(uint8_t index) {
+  const String label = scaleAdcLabel(index);
+  return label == "CONNECTED"
+             ? COLOR_SUCCESS
+             : (label == "UNKNOWN" ? COLOR_WARNING : COLOR_DANGER);
+}
+
+String scaleOledLabel(uint8_t index) {
+  const ScaleState &state = scaleStates[index];
+  if (!state.connected || state.lastTelemetryMs == 0) {
+    return "UNKNOWN";
+  }
+  return state.flags & DualScaleBle::OledPresent ? "CONNECTED" : "NOT FOUND";
+}
+
+uint16_t scaleOledColor(uint8_t index) {
+  const String label = scaleOledLabel(index);
+  return label == "CONNECTED"
+             ? COLOR_SUCCESS
+             : (label == "UNKNOWN" ? COLOR_WARNING : COLOR_DANGER);
+}
+
+String scaleDataLabel(uint8_t index) {
+  const ScaleState &state = scaleStates[index];
+  if (!state.connected) {
+    return "NO LINK";
+  }
+  if (scaleUsable(index)) {
+    return "LIVE";
+  }
+  if (state.lastTelemetryMs != 0 &&
+      millis() - state.lastTelemetryMs > TELEMETRY_STALE_MS) {
+    return "STALE";
+  }
+  if (state.goodPacketCount > 0 &&
+      state.goodPacketCount < REQUIRED_GOOD_PACKETS) {
+    return "VALIDATING";
+  }
+  return "NOT READY";
+}
+
+uint16_t scaleDataColor(uint8_t index) {
+  const String label = scaleDataLabel(index);
+  return label == "LIVE"
+             ? COLOR_SUCCESS
+             : (label == "VALIDATING" || label == "NOT READY"
+                    ? COLOR_WARNING
+                    : COLOR_DANGER);
+}
+
+String scaleAgeLabel(uint8_t index) {
+  const ScaleState &state = scaleStates[index];
+  if (state.lastTelemetryMs == 0) {
+    return "--";
+  }
+  const uint32_t ageMs = millis() - state.lastTelemetryMs;
+  if (ageMs < 1000) {
+    return String(ageMs) + " ms";
+  }
+  return String(ageMs / 1000.0f, 1) + " s";
+}
+
+uint16_t scaleAgeColor(uint8_t index) {
+  if (scaleStates[index].lastTelemetryMs == 0) {
+    return COLOR_DANGER;
+  }
+  return millis() - scaleStates[index].lastTelemetryMs <= TELEMETRY_STALE_MS
+             ? COLOR_SUCCESS
+             : COLOR_DANGER;
+}
+
+void drawConnectivityItem(int16_t centerX,
+                          int16_t labelY,
+                          const String &label,
+                          const String &value,
+                          uint16_t valueColor) {
+  setCenteredText(label,
+                  centerX,
+                  labelY,
+                  1,
+                  COLOR_MUTED,
+                  COLOR_PANEL);
+  tft.fillRect(centerX - 51,
+               labelY + 9,
+               102,
+               14,
+               COLOR_PANEL);
+  setCenteredText(value,
+                  centerX,
+                  labelY + 15,
+                  1,
+                  valueColor,
+                  COLOR_PANEL);
+}
+
+void drawConnectivityDynamic() {
+  constexpr int16_t LEFT_CENTER_X = 61;
+  constexpr int16_t RIGHT_CENTER_X = 178;
+
+  drawConnectivityItem(LEFT_CENTER_X,
+                       101,
+                       "BLUETOOTH",
+                       scaleLinkLabel(0),
+                       scaleLinkColor(0));
+  drawConnectivityItem(LEFT_CENTER_X,
+                       131,
+                       "LOAD CELL ADC",
+                       scaleAdcLabel(0),
+                       scaleAdcColor(0));
+  drawConnectivityItem(LEFT_CENTER_X,
+                       161,
+                       "OLED SCREEN",
+                       scaleOledLabel(0),
+                       scaleOledColor(0));
+  drawConnectivityItem(LEFT_CENTER_X,
+                       191,
+                       "WEIGHT DATA",
+                       scaleDataLabel(0),
+                       scaleDataColor(0));
+  drawConnectivityItem(LEFT_CENTER_X,
+                       221,
+                       "DATA AGE",
+                       scaleAgeLabel(0),
+                       scaleAgeColor(0));
+
+  drawConnectivityItem(RIGHT_CENTER_X,
+                       101,
+                       "BLUETOOTH",
+                       scaleLinkLabel(1),
+                       scaleLinkColor(1));
+  drawConnectivityItem(RIGHT_CENTER_X,
+                       131,
+                       "LOAD CELL ADC",
+                       scaleAdcLabel(1),
+                       scaleAdcColor(1));
+  drawConnectivityItem(RIGHT_CENTER_X,
+                       161,
+                       "OLED SCREEN",
+                       scaleOledLabel(1),
+                       scaleOledColor(1));
+  drawConnectivityItem(RIGHT_CENTER_X,
+                       191,
+                       "WEIGHT DATA",
+                       scaleDataLabel(1),
+                       scaleDataColor(1));
+  drawConnectivityItem(RIGHT_CENTER_X,
+                       221,
+                       "DATA AGE",
+                       scaleAgeLabel(1),
+                       scaleAgeColor(1));
+
+  // The 8-pixel strip between the panels and button gives CHECK BOTH
+  // immediate feedback without redrawing the whole Link Status page.
+  tft.fillRect(6, 270, 228, 8, COLOR_BACKGROUND);
+  if (noticeActive()) {
+    setCenteredText(noticeMessage,
+                    SCREEN_WIDTH / 2,
+                    274,
+                    1,
+                    COLOR_WARNING,
+                    COLOR_BACKGROUND);
+  }
+}
+
+void drawConnectivityPage() {
+  tft.fillScreen(COLOR_BACKGROUND);
+  drawHeader("LINK STATUS", true);
+
+  constexpr int16_t LEFT_PANEL_X = 6;
+  constexpr int16_t RIGHT_PANEL_X = 123;
+  constexpr int16_t PANEL_Y = 51;
+  constexpr int16_t PANEL_WIDTH = 111;
+  constexpr int16_t PANEL_HEIGHT = 219;
+  constexpr int16_t LEFT_CENTER_X = 61;
+  constexpr int16_t RIGHT_CENTER_X = 178;
+
+  tft.fillRoundRect(LEFT_PANEL_X,
+                    PANEL_Y,
+                    PANEL_WIDTH,
+                    PANEL_HEIGHT,
+                    9,
+                    COLOR_PANEL);
+  tft.fillRoundRect(RIGHT_PANEL_X,
+                    PANEL_Y,
+                    PANEL_WIDTH,
+                    PANEL_HEIGHT,
+                    9,
+                    COLOR_PANEL);
+
+  setCenteredText("SCALE 1",
+                  LEFT_CENTER_X,
+                  66,
+                  2,
+                  TFT_WHITE,
+                  COLOR_PANEL);
+  setCenteredText("LOAD-CELL ESP32",
+                  LEFT_CENTER_X,
+                  84,
+                  1,
+                  COLOR_MUTED,
+                  COLOR_PANEL);
+  setCenteredText("SCALE 2",
+                  RIGHT_CENTER_X,
+                  66,
+                  2,
+                  TFT_WHITE,
+                  COLOR_PANEL);
+  setCenteredText("LOAD-CELL ESP32",
+                  RIGHT_CENTER_X,
+                  84,
+                  1,
+                  COLOR_MUTED,
+                  COLOR_PANEL);
+
+  tft.drawFastHLine(14, 94, 95, COLOR_PANEL_LIGHT);
+  tft.drawFastHLine(131, 94, 95, COLOR_PANEL_LIGHT);
+
+  drawConnectivityDynamic();
+
+  drawButton(6,
+             278,
+             228,
+             35,
+             "CHECK BOTH",
+             COLOR_PRIMARY,
+             COLOR_PRIMARY,
+             1);
+}
+
+void drawCurrentPage() {
+  if (currentPage == Page::Dashboard) {
+    drawDashboard();
+  } else if (currentPage == Page::Calibration) {
+    drawCalibrationPage();
+  } else if (currentPage == Page::Settings) {
+    drawSettingsPage();
+  } else {
+    drawConnectivityPage();
+  }
+  pageDirty = false;
+  uiDirty = false;
+}
+
+void updateCurrentPage() {
+  if (currentPage == Page::Dashboard) {
+    drawDashboardDynamic();
+  } else if (currentPage == Page::Calibration) {
+    drawCalibrationDynamic();
+  } else if (currentPage == Page::Settings) {
+    drawSettingsDynamic();
+  } else {
+    drawConnectivityDynamic();
+  }
+  uiDirty = false;
+}
+
+void drawIdleWarningCountdown(uint8_t secondsRemaining) {
+  tft.fillRect(20, 174, 200, 20, COLOR_BACKGROUND);
+  setCenteredText("Screen off in " + String(secondsRemaining) + " sec",
+                  SCREEN_WIDTH / 2,
+                  184,
+                  1,
+                  COLOR_WARNING,
+                  COLOR_BACKGROUND);
+}
+
+void drawIdleWarning(uint8_t secondsRemaining) {
+  tft.fillScreen(COLOR_BACKGROUND);
+  setCenteredText("SNOOZING",
+                  SCREEN_WIDTH / 2,
+                  116,
+                  3,
+                  TFT_WHITE,
+                  COLOR_BACKGROUND);
+  setCenteredText("No recent touchscreen activity",
+                  SCREEN_WIDTH / 2,
+                  158,
+                  1,
+                  COLOR_MUTED,
+                  COLOR_BACKGROUND);
+  drawIdleWarningCountdown(secondsRemaining);
+  setCenteredText("Touch screen to stay awake",
+                  SCREEN_WIDTH / 2,
+                  210,
+                  1,
+                  TFT_WHITE,
+                  COLOR_BACKGROUND);
+  uiDirty = false;
+}
+
+void setScreenSleeping(bool sleeping) {
+  if (screenSleeping == sleeping) {
+    return;
+  }
+
+  idleWarningActive = false;
+  idleWarningSecondsShown = 0;
+
+  if (sleeping) {
+    Serial.println("Screen standby: LCD and backlight off; touch stays awake.");
+    screenSleeping = true;
+    touchWasDown = false;
+
+    tft.writecommand(TFT_DISPOFF);
+    delay(20);
+    tft.writecommand(TFT_SLPIN);
+    delay(120);
+    applyBacklightOutput(false);
+    return;
+  }
+
+  Serial.println("Screen standby ended.");
+  tft.writecommand(TFT_SLPOUT);
+  delay(120);
+  tft.writecommand(TFT_DISPON);
+
+  if (!touchReady) {
+    touchReady = beginTouchController();
+  }
+  screenSleeping = false;
+  lastUserActivityMs = millis();
+  pageDirty = true;
+  uiDirty = true;
+  // Restore a complete frame while the backlight is still dark, then reveal
+  // it in one step so wake-up never exposes stale framebuffer contents.
+  drawCurrentPage();
+  applyBacklightOutput(true);
+}
+
+bool queueBleManagerMessage(const BleManagerMessage &message) {
+  return bleManagerQueue != nullptr &&
+         xQueueSend(bleManagerQueue, &message, 0) == pdTRUE;
+}
+
+void queueBleUiEvent(const BleUiEvent &event) {
+  if (bleUiQueue != nullptr) {
+    xQueueSend(bleUiQueue, &event, 0);
+  }
+}
+
+void queueSimpleBleUiEvent(BleUiEventType type,
+                           uint8_t scaleIndex,
+                           int reason = 0) {
+  BleUiEvent event;
+  event.type = type;
+  event.scaleIndex = scaleIndex;
+  event.reason = reason;
+  queueBleUiEvent(event);
+}
+
+class DisplayBleScanCallbacks : public NimBLEScanCallbacks {
+public:
+  void onResult(const NimBLEAdvertisedDevice *device) override {
+    static uint32_t lastQueuedMs[REMOTE_SCALE_COUNT] = {};
+    const NimBLEUUID serviceUuid(DualScaleBle::SERVICE_UUID);
+    if (!device->isAdvertisingService(serviceUuid) || !device->haveName()) {
+      return;
+    }
+
+    const std::string name = device->getName();
+    for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+      if (name != REMOTE_SCALES[index].bluetoothName ||
+          millis() - lastQueuedMs[index] < 1000) {
+        continue;
+      }
+
+      BleManagerMessage message;
+      message.type = BleManagerMessageType::Discovered;
+      message.scaleIndex = index;
+      message.addressType = device->getAddress().getType();
+      // uint64_t preserves NimBLE's native byte order. Reconstructing from a
+      // raw uint8_t[6] would invoke the Bluedroid-compatibility constructor
+      // and reverse the address.
+      message.addressValue =
+          static_cast<uint64_t>(device->getAddress());
+      if (queueBleManagerMessage(message)) {
+        lastQueuedMs[index] = millis();
+      }
+      return;
+    }
+  }
+};
+
+class DisplayBleClientCallbacks : public NimBLEClientCallbacks {
+public:
+  explicit DisplayBleClientCallbacks(uint8_t scaleIndex)
+      : scaleIndex_(scaleIndex) {}
+
+  void onDisconnect(NimBLEClient *, int reason) override {
+    BleManagerMessage message;
+    message.type = BleManagerMessageType::Disconnected;
+    message.scaleIndex = scaleIndex_;
+    message.command.valueGrams = reason;
+    queueBleManagerMessage(message);
+  }
+
+private:
+  uint8_t scaleIndex_;
+};
+
+DisplayBleScanCallbacks bleScanCallbacks;
+DisplayBleClientCallbacks bleClientCallbacks[REMOTE_SCALE_COUNT] = {
+    DisplayBleClientCallbacks(0),
+    DisplayBleClientCallbacks(1),
+};
+
+void onBleTelemetry(uint8_t scaleIndex,
+                    uint8_t *data,
+                    size_t length) {
+  if (length != sizeof(DualScaleBle::TelemetryPacket)) {
+    return;
+  }
+
+  BleUiEvent event;
+  event.type = BleUiEventType::Telemetry;
+  event.scaleIndex = scaleIndex;
+  memcpy(&event.telemetry, data, sizeof(event.telemetry));
+  queueBleUiEvent(event);
+}
+
+void markTransportDisconnected(uint8_t scaleIndex,
+                               int reason,
+                               bool notifyUi = true) {
+  BleTransportSlot &slot = bleTransport[scaleIndex];
+  slot.connected = false;
+  slot.telemetryCharacteristic = nullptr;
+  slot.commandCharacteristic = nullptr;
+  slot.nextAttemptMs = millis() + RECONNECT_INTERVAL_MS;
+  if (notifyUi) {
+    queueSimpleBleUiEvent(BleUiEventType::Disconnected,
+                          scaleIndex,
+                          reason);
+  }
+}
+
+void recordBleConnectFailure(uint8_t scaleIndex, int reason) {
+  BleTransportSlot &slot = bleTransport[scaleIndex];
+  markTransportDisconnected(scaleIndex, reason);
+  if (slot.consecutiveConnectFailures < UINT8_MAX) {
+    ++slot.consecutiveConnectFailures;
+  }
+
+  if (slot.consecutiveConnectFailures >=
+      MAX_ADDRESS_CONNECT_FAILURES) {
+    Serial.printf(
+        "BLE Scale %u address failed repeatedly; rediscovering.\n",
+        scaleIndex + 1);
+    slot.addressKnown = false;
+    slot.consecutiveConnectFailures = 0;
+    bleForceScanRequested = true;
+  }
+}
+
+bool connectBleScale(uint8_t scaleIndex) {
+  BleTransportSlot &slot = bleTransport[scaleIndex];
+  if (!slot.addressKnown) {
+    return false;
+  }
+
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  if (scan->isScanning()) {
+    scan->stop();
+  }
+
+  queueSimpleBleUiEvent(BleUiEventType::Connecting, scaleIndex);
+
+  if (slot.client == nullptr) {
+    slot.client = NimBLEDevice::createClient(slot.address);
+    if (slot.client == nullptr) {
+      recordBleConnectFailure(scaleIndex, -1);
+      return false;
+    }
+    slot.client->setClientCallbacks(&bleClientCallbacks[scaleIndex], false);
+    slot.client->setConnectionParams(24, 40, 0, 400);
+    slot.client->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
+  } else {
+    slot.client->setPeerAddress(slot.address);
+  }
+
+  // Attribute discovery is deliberately refreshed after every reconnect.
+  // Sender firmware can be updated independently without leaving stale handles.
+  if (!slot.client->connect(slot.address, true, false, false)) {
+    const int error = slot.client->getLastError();
+    Serial.printf("BLE Scale %u connect failed: %d\n",
+                  scaleIndex + 1,
+                  error);
+    recordBleConnectFailure(scaleIndex, error);
+    return false;
+  }
+
+  NimBLERemoteService *service =
+      slot.client->getService(DualScaleBle::SERVICE_UUID);
+  if (service == nullptr) {
+    Serial.printf("BLE Scale %u service not found.\n", scaleIndex + 1);
+    slot.client->disconnect();
+    recordBleConnectFailure(scaleIndex, -2);
+    return false;
+  }
+
+  slot.telemetryCharacteristic =
+      service->getCharacteristic(DualScaleBle::TELEMETRY_UUID);
+  slot.commandCharacteristic =
+      service->getCharacteristic(DualScaleBle::COMMAND_UUID);
+
+  if (slot.telemetryCharacteristic == nullptr ||
+      slot.commandCharacteristic == nullptr ||
+      !slot.telemetryCharacteristic->canNotify() ||
+      (!slot.commandCharacteristic->canWrite() &&
+       !slot.commandCharacteristic->canWriteNoResponse())) {
+    Serial.printf("BLE Scale %u characteristics are incompatible.\n",
+                  scaleIndex + 1);
+    slot.client->disconnect();
+    recordBleConnectFailure(scaleIndex, -3);
+    return false;
+  }
+
+  const bool subscribed = slot.telemetryCharacteristic->subscribe(
+      true,
+      [scaleIndex](NimBLERemoteCharacteristic *,
+                   uint8_t *data,
+                   size_t length,
+                   bool) { onBleTelemetry(scaleIndex, data, length); },
+      true);
+  if (!subscribed) {
+    Serial.printf("BLE Scale %u notification subscribe failed.\n",
+                  scaleIndex + 1);
+    slot.client->disconnect();
+    recordBleConnectFailure(scaleIndex, -4);
+    return false;
+  }
+
+  slot.connected = true;
+  slot.consecutiveConnectFailures = 0;
+  slot.nextAttemptMs = 0;
+  Serial.printf("BLE Scale %u connected and subscribed.\n", scaleIndex + 1);
+  queueSimpleBleUiEvent(BleUiEventType::Connected, scaleIndex);
+  return true;
+}
+
+bool writeBleCommand(uint8_t scaleIndex,
+                     const DualScaleBle::CommandPacket &command) {
+  BleTransportSlot &slot = bleTransport[scaleIndex];
+  if (!slot.connected ||
+      slot.client == nullptr ||
+      !slot.client->isConnected() ||
+      slot.commandCharacteristic == nullptr) {
+    return false;
+  }
+
+  const bool useResponse = slot.commandCharacteristic->canWrite();
+  return slot.commandCharacteristic->writeValue(
+      reinterpret_cast<const uint8_t *>(&command),
+      sizeof(command),
+      useResponse);
+}
+
+void handleBleManagerMessage(const BleManagerMessage &message) {
+  if (message.scaleIndex >= REMOTE_SCALE_COUNT &&
+      message.type != BleManagerMessageType::ForceCheck) {
+    return;
+  }
+
+  if (message.type == BleManagerMessageType::Discovered) {
+    BleTransportSlot &slot = bleTransport[message.scaleIndex];
+    const NimBLEAddress address(message.addressValue,
+                                message.addressType);
+    if (!slot.addressKnown || slot.address != address) {
+      slot.address = address;
+      slot.addressKnown = true;
+      slot.nextAttemptMs = 0;
+      Serial.printf("Discovered BLE Scale %u at %s.\n",
+                    message.scaleIndex + 1,
+                    address.toString().c_str());
+      queueSimpleBleUiEvent(BleUiEventType::Discovered,
+                            message.scaleIndex);
+    }
+    return;
+  }
+
+  if (message.type == BleManagerMessageType::Disconnected) {
+    // A disconnect callback from the previous link can arrive after a fast
+    // reconnect. Do not let that stale callback tear down the new session.
+    BleTransportSlot &slot = bleTransport[message.scaleIndex];
+    if (slot.client != nullptr && slot.client->isConnected()) {
+      return;
+    }
+    markTransportDisconnected(message.scaleIndex,
+                              message.command.valueGrams);
+    return;
+  }
+
+  if (message.type == BleManagerMessageType::SendCommand) {
+    if (!writeBleCommand(message.scaleIndex, message.command)) {
+      queueSimpleBleUiEvent(BleUiEventType::CommandWriteFailed,
+                            message.scaleIndex);
+    }
+    return;
+  }
+
+  if (message.type == BleManagerMessageType::Reconnect) {
+    BleTransportSlot &slot = bleTransport[message.scaleIndex];
+    if (slot.client != nullptr && slot.client->isConnected()) {
+      slot.client->disconnect();
+    }
+    markTransportDisconnected(message.scaleIndex, -5);
+    slot.nextAttemptMs = 0;
+    return;
+  }
+
+  if (message.type == BleManagerMessageType::ForceCheck) {
+    for (BleTransportSlot &slot : bleTransport) {
+      if (!slot.connected) {
+        // The offline board may have been replaced and therefore have a new
+        // BLE address. Rediscover it by service UUID and unit name.
+        slot.addressKnown = false;
+        slot.consecutiveConnectFailures = 0;
+        slot.nextAttemptMs = 0;
+      }
+    }
+    bleForceScanRequested = true;
+  }
+}
+
+void bleManagerTask(void *) {
+  if (!NimBLEDevice::init(LOCAL_BLUETOOTH_NAME)) {
+    Serial.println("ERROR: NimBLE initialization failed.");
+    queueSimpleBleUiEvent(BleUiEventType::RadioReady, 0, -1);
+    vTaskDelete(nullptr);
+  }
+
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->setScanCallbacks(&bleScanCallbacks, true);
+  scan->setActiveScan(true);
+  scan->setInterval(60);
+  scan->setWindow(30);
+  // Callback-only scanning cannot fill up in a BLE-dense room. The callback
+  // copies each matching address before NimBLE releases its temporary result.
+  scan->setMaxResults(0);
+  queueSimpleBleUiEvent(BleUiEventType::RadioReady, 0, 1);
+  uint32_t nextScanAtMs = 0;
+
+  while (true) {
+    BleManagerMessage message;
+    while (xQueueReceive(bleManagerQueue, &message, 0) == pdTRUE) {
+      handleBleManagerMessage(message);
+    }
+
+    for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+      BleTransportSlot &slot = bleTransport[index];
+      if (slot.connected &&
+          (slot.client == nullptr || !slot.client->isConnected())) {
+        markTransportDisconnected(index, slot.client
+                                             ? slot.client->getLastError()
+                                             : -6);
+      }
+    }
+
+    if (bleForceScanRequested) {
+      bleForceScanRequested = false;
+      nextScanAtMs = 0;
+    }
+
+    bool attemptedConnection = false;
+    if (!screenSleeping) {
+      for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+        BleTransportSlot &slot = bleTransport[index];
+        if (!slot.connected &&
+            slot.addressKnown &&
+            static_cast<int32_t>(millis() - slot.nextAttemptMs) >= 0) {
+          connectBleScale(index);
+          attemptedConnection = true;
+          break;
+        }
+      }
+    }
+    if (attemptedConnection) {
+      nextScanAtMs = millis() + BLE_SCAN_PAUSE_MS;
+    }
+
+    bool scanNeeded = false;
+    for (const BleTransportSlot &slot : bleTransport) {
+      scanNeeded |= !slot.addressKnown;
+    }
+
+    if (screenSleeping) {
+      if (scan->isScanning()) {
+        scan->stop();
+      }
+      // Wake-up starts a fresh discovery window immediately.
+      nextScanAtMs = 0;
+    } else if (scanNeeded &&
+               !scan->isScanning() &&
+               !attemptedConnection &&
+               (nextScanAtMs == 0 ||
+                static_cast<int32_t>(millis() - nextScanAtMs) >= 0)) {
+      if (scan->start(BLE_SCAN_WINDOW_MS, false, true)) {
+        nextScanAtMs =
+            millis() + BLE_SCAN_WINDOW_MS + BLE_SCAN_PAUSE_MS;
+      } else {
+        nextScanAtMs = millis() + BLE_SCAN_PAUSE_MS;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+bool startBleManager() {
+  bleManagerQueue =
+      xQueueCreate(16, sizeof(BleManagerMessage));
+  bleUiQueue = xQueueCreate(24, sizeof(BleUiEvent));
+  if (bleManagerQueue == nullptr || bleUiQueue == nullptr) {
+    Serial.println("ERROR: Could not create BLE queues.");
+    return false;
+  }
+
+  const BaseType_t created = xTaskCreate(bleManagerTask,
+                                         "ble-manager",
+                                         8192,
+                                         nullptr,
+                                         1,
+                                         nullptr);
+  if (created != pdPASS) {
+    Serial.println("ERROR: Could not create BLE manager task.");
+    return false;
+  }
+  return true;
+}
+
+void requestBleReconnect(uint8_t scaleIndex) {
+  if (scaleIndex >= REMOTE_SCALE_COUNT ||
+      scaleStates[scaleIndex].reconnectRequested) {
+    return;
+  }
+
+  BleManagerMessage message;
+  message.type = BleManagerMessageType::Reconnect;
+  message.scaleIndex = scaleIndex;
+  if (queueBleManagerMessage(message)) {
+    scaleStates[scaleIndex].reconnectRequested = true;
+  }
+}
+
+bool queueScaleCommand(uint8_t scaleIndex,
+                       DualScaleBle::CommandType commandType,
+                       int32_t valueGrams = 0) {
+  if (scaleIndex >= REMOTE_SCALE_COUNT ||
+      !scaleStates[scaleIndex].connected ||
+      scaleStates[scaleIndex].pendingToken != 0) {
+    return false;
+  }
+
+  uint16_t token = nextCommandToken++;
+  if (token == 0) {
+    token = nextCommandToken++;
+  }
+
+  BleManagerMessage message;
+  message.type = BleManagerMessageType::SendCommand;
+  message.scaleIndex = scaleIndex;
+  message.command.magic = DualScaleBle::COMMAND_MAGIC;
+  message.command.version = DualScaleBle::PROTOCOL_VERSION;
+  message.command.targetUnit = scaleIndex + 1;
+  message.command.token = token;
+  message.command.command = static_cast<uint8_t>(commandType);
+  message.command.unlockRequestGeneration =
+      scaleStates[scaleIndex].unlockRequestGeneration;
+  message.command.valueGrams = valueGrams;
+
+  if (!queueBleManagerMessage(message)) {
+    return false;
+  }
+
+  scaleStates[scaleIndex].pendingToken = token;
+  scaleStates[scaleIndex].pendingCommand = commandType;
+  scaleStates[scaleIndex].pendingCommandAtMs = millis();
+  return true;
+}
+
+void markPeerStatusSyncPending() {
+  for (bool &pending : peerStatusSyncPending) {
+    pending = true;
+  }
+}
+
+bool peerScaleConnectedFor(uint8_t scaleIndex) {
+  const uint8_t peerIndex = scaleIndex == 0 ? 1 : 0;
+  const ScaleState &peer = scaleStates[peerIndex];
+  return peer.connected && peer.identityVerified;
+}
+
+void servicePeerStatusSync() {
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    ScaleState &state = scaleStates[index];
+    if (!peerStatusSyncPending[index] ||
+        !state.connected ||
+        !state.identityVerified ||
+        state.pendingToken != 0) {
+      continue;
+    }
+
+    // PeerStatus reuses valueGrams as a compact boolean: 1 means the other
+    // verified scale is connected to this touchscreen; 0 means disconnected.
+    const int32_t peerConnected =
+        peerScaleConnectedFor(index) ? 1 : 0;
+    if (queueScaleCommand(index,
+                          DualScaleBle::CommandType::PeerStatus,
+                          peerConnected)) {
+      peerStatusSyncPending[index] = false;
+      Serial.printf("Reported peer %s to Scale %u.\n",
+                    peerConnected ? "connected" : "disconnected",
+                    index + 1);
+    }
+  }
+}
+
+bool scaleShouldDisplayLocked(uint8_t scaleIndex) {
+  return weightLockPhase == WeightLockPhase::Locked &&
+         lockedWeightSnapshot.scaleIncluded[scaleIndex];
+}
+
+bool scaleReportsDesiredWeightLock(uint8_t scaleIndex) {
+  const ScaleState &state = scaleStates[scaleIndex];
+  const bool reportsLocked =
+      (state.flags & DualScaleBle::TelemetryFlag::WeightLocked) != 0;
+  const bool reportsUnlockRequest =
+      (state.flags & DualScaleBle::TelemetryFlag::UnlockRequested) != 0;
+  return scaleShouldDisplayLocked(scaleIndex)
+             ? reportsLocked && !reportsUnlockRequest
+             : !reportsLocked && !reportsUnlockRequest;
+}
+
+void serviceWeightLockSync() {
+  const uint32_t now = millis();
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    ScaleState &state = scaleStates[index];
+    if (!state.connected || !state.identityVerified) {
+      continue;
+    }
+
+    if (!weightLockSyncPending[index] &&
+        !scaleReportsDesiredWeightLock(index)) {
+      weightLockSyncPending[index] = true;
+      weightLockSyncRetryAtMs[index] = 0;
+    }
+
+    if (!weightLockSyncPending[index] ||
+        state.pendingToken != 0 ||
+        (weightLockSyncRetryAtMs[index] != 0 &&
+         static_cast<int32_t>(
+             now - weightLockSyncRetryAtMs[index]) < 0)) {
+      continue;
+    }
+
+    // A latched physical-button request always wins over a desired lock. The
+    // touchscreen must clear/acknowledge it before any new settling window.
+    const bool unlockRequestPending =
+        (state.flags &
+         DualScaleBle::TelemetryFlag::UnlockRequested) != 0;
+    const bool shouldLock =
+        scaleShouldDisplayLocked(index) && !unlockRequestPending;
+    const auto command =
+        shouldLock
+            ? DualScaleBle::CommandType::SetWeightLock
+            : DualScaleBle::CommandType::ClearWeightLock;
+    const int32_t valueGrams =
+        shouldLock ? lockedWeightSnapshot.scaleGrams[index] : 0;
+    if (queueScaleCommand(index, command, valueGrams)) {
+      weightLockSyncRetryAtMs[index] =
+          now + WEIGHT_LOCK_SYNC_RETRY_MS;
+      Serial.printf("Synchronizing Scale %u OLED: %s %.2f kg.\n",
+                    index + 1,
+                    shouldLock ? "LOCK" : "UNLOCK",
+                    static_cast<float>(valueGrams) / 1000.0f);
+    } else {
+      weightLockSyncRetryAtMs[index] =
+          now + WEIGHT_LOCK_SYNC_RETRY_MS;
+    }
+  }
+}
+
+void triggerConnectivityCheck() {
+  BleManagerMessage forceMessage;
+  forceMessage.type = BleManagerMessageType::ForceCheck;
+  queueBleManagerMessage(forceMessage);
+
+  uint8_t commandCount = 0;
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    if (queueScaleCommand(index, DualScaleBle::CommandType::Status)) {
+      ++commandCount;
+    }
+  }
+  showNotice(commandCount ? "Checking both scales..."
+                          : (connectedScaleCount()
+                                 ? "Scale command already running"
+                                 : "Searching for both scales..."),
+             1800);
+}
+
+void processBleUiEvents() {
+  if (bleUiQueue == nullptr) {
+    return;
+  }
+
+  BleUiEvent event;
+  while (xQueueReceive(bleUiQueue, &event, 0) == pdTRUE) {
+    if (event.type == BleUiEventType::RadioReady) {
+      bluetoothReady = event.reason > 0;
+      if (!bluetoothReady) {
+        showNotice("BLE radio failed", 5000);
+      }
+      markConnectionUiDirty();
+      continue;
+    }
+
+    if (event.scaleIndex >= REMOTE_SCALE_COUNT) {
+      continue;
+    }
+    ScaleState &state = scaleStates[event.scaleIndex];
+
+    if (event.type == BleUiEventType::Discovered) {
+      state.discovered = true;
+      markConnectionUiDirty(event.scaleIndex);
+      continue;
+    }
+    if (event.type == BleUiEventType::Connecting) {
+      state.connecting = true;
+      state.reconnectRequested = false;
+      markConnectionUiDirty(event.scaleIndex);
+      continue;
+    }
+    if (event.type == BleUiEventType::Connected) {
+      state.connected = true;
+      state.connecting = false;
+      state.subscribed = true;
+      state.reconnectRequested = false;
+      state.identityVerified = false;
+      state.goodPacketCount = 0;
+      state.connectedAtMs = millis();
+      state.lastTelemetryMs = 0;
+      state.pendingToken = 0;
+      state.pendingCommandAtMs = 0;
+      state.unlockRequestGeneration = 0;
+      state.handledUnlockRequestGeneration = 0;
+      state.unlockRequestHandled = false;
+      weightLockSyncPending[event.scaleIndex] = true;
+      weightLockSyncRetryAtMs[event.scaleIndex] = 0;
+      markPeerStatusSyncPending();
+      markConnectionUiDirty(event.scaleIndex);
+      continue;
+    }
+    if (event.type == BleUiEventType::Disconnected) {
+      state.connected = false;
+      state.connecting = false;
+      state.subscribed = false;
+      state.identityVerified = false;
+      state.goodPacketCount = 0;
+      state.flags = 0;
+      state.reconnectRequested = false;
+      state.connectedAtMs = 0;
+      state.pendingToken = 0;
+      state.pendingCommandAtMs = 0;
+      state.unlockRequestGeneration = 0;
+      state.handledUnlockRequestGeneration = 0;
+      state.unlockRequestHandled = false;
+      weightLockSyncPending[event.scaleIndex] = true;
+      weightLockSyncRetryAtMs[event.scaleIndex] = 0;
+      markPeerStatusSyncPending();
+      markConnectionUiDirty(event.scaleIndex);
+      continue;
+    }
+    if (event.type == BleUiEventType::CommandWriteFailed) {
+      const bool peerStatusCommand =
+          state.pendingCommand == DualScaleBle::CommandType::PeerStatus;
+      const bool weightLockCommand =
+          state.pendingCommand == DualScaleBle::CommandType::SetWeightLock ||
+          state.pendingCommand ==
+              DualScaleBle::CommandType::ClearWeightLock;
+      state.pendingToken = 0;
+      state.pendingCommandAtMs = 0;
+      if (peerStatusCommand) {
+        peerStatusSyncPending[event.scaleIndex] = true;
+      } else if (weightLockCommand) {
+        weightLockSyncPending[event.scaleIndex] = true;
+        weightLockSyncRetryAtMs[event.scaleIndex] =
+            millis() + WEIGHT_LOCK_SYNC_RETRY_MS;
+        Serial.printf("Scale %u weight-lock sync write failed; retrying.\n",
+                      event.scaleIndex + 1);
+      } else {
+        showNotice("Scale " + String(event.scaleIndex + 1) +
+                       " command failed",
+                   3500);
+      }
+      continue;
+    }
+    if (event.type != BleUiEventType::Telemetry) {
+      continue;
+    }
+
+    const DualScaleBle::TelemetryPacket &packet = event.telemetry;
+    const bool identityValid =
+        packet.magic == DualScaleBle::TELEMETRY_MAGIC &&
+        packet.version == DualScaleBle::PROTOCOL_VERSION &&
+        packet.unit == event.scaleIndex + 1;
+    const bool statusValid =
+        packet.status <=
+        static_cast<uint8_t>(DualScaleBle::Status::ShuttingDown);
+    if (!identityValid || !statusValid) {
+      state.identityVerified = false;
+      state.goodPacketCount = 0;
+      markPeerStatusSyncPending();
+      markConnectionUiDirty(event.scaleIndex);
+      requestBleReconnect(event.scaleIndex);
+      continue;
+    }
+
+    const bool identityWasVerified = state.identityVerified;
+    const bool wasUsable = scaleUsable(event.scaleIndex);
+    const int32_t previousWeightGrams = state.weightGrams;
+    const DualScaleBle::Status previousStatus = state.status;
+    const uint8_t previousFlags = state.flags;
+    const bool newSequence =
+        state.lastTelemetryMs == 0 || packet.sequence != state.sequence;
+    state.identityVerified = true;
+    state.connected = true;
+    state.subscribed = true;
+    state.sequence = packet.sequence;
+    state.weightGrams = packet.weightGrams;
+    state.status = static_cast<DualScaleBle::Status>(packet.status);
+    state.flags = packet.flags;
+    state.commandResult = packet.commandResult;
+    state.acknowledgedToken = packet.acknowledgedToken;
+    state.unlockRequestGeneration =
+        packet.unlockRequestGeneration;
+    state.lastTelemetryMs = millis();
+    state.reconnectRequested = false;
+    if (!identityWasVerified) {
+      markPeerStatusSyncPending();
+    }
+
+    const bool packetUsable =
+        state.status == DualScaleBle::Status::Ready &&
+        requiredTelemetryFlagsPresent(state);
+    if (!packetUsable) {
+      state.goodPacketCount = 0;
+    } else if (newSequence) {
+      state.goodPacketCount =
+          static_cast<uint8_t>(
+              min<int>(state.goodPacketCount + 1, 255));
+    }
+
+    const bool unlockRequested =
+        (state.flags &
+         DualScaleBle::TelemetryFlag::UnlockRequested) != 0;
+    if (unlockRequested &&
+        (!state.unlockRequestHandled ||
+         state.handledUnlockRequestGeneration !=
+             state.unlockRequestGeneration)) {
+      state.unlockRequestHandled = true;
+      state.handledUnlockRequestGeneration =
+          state.unlockRequestGeneration;
+      unlockCombinedWeight(
+          event.scaleIndex == 0
+              ? "Scale A button"
+              : "Scale B button");
+    } else if (!unlockRequested) {
+      state.unlockRequestHandled = false;
+    }
+
+    const bool nonWeightStateChanged =
+        previousStatus != state.status ||
+        previousFlags != state.flags ||
+        wasUsable != scaleUsable(event.scaleIndex);
+    if (nonWeightStateChanged) {
+      dashboardScaleDirty[event.scaleIndex] = true;
+      if (currentPage == Page::Dashboard) {
+        uiDirty = true;
+      }
+    }
+    if (weightLockPhase != WeightLockPhase::Locked &&
+        previousWeightGrams != state.weightGrams) {
+      dashboardScaleWeightDirty[event.scaleIndex] = true;
+      if (currentPage == Page::Dashboard) {
+        uiDirty = true;
+      }
+    }
+
+    if (state.pendingToken != 0 &&
+        packet.acknowledgedToken == state.pendingToken &&
+        packet.commandResult !=
+            static_cast<uint8_t>(DualScaleBle::CommandResult::None) &&
+        packet.commandResult !=
+            static_cast<uint8_t>(DualScaleBle::CommandResult::Accepted)) {
+      const bool success =
+          packet.commandResult ==
+          static_cast<uint8_t>(DualScaleBle::CommandResult::Success);
+      const bool setWeightLockCommand =
+          state.pendingCommand ==
+          DualScaleBle::CommandType::SetWeightLock;
+      const bool clearWeightLockCommand =
+          state.pendingCommand ==
+          DualScaleBle::CommandType::ClearWeightLock;
+      if (state.pendingCommand == DualScaleBle::CommandType::PeerStatus) {
+        if (!success) {
+          peerStatusSyncPending[event.scaleIndex] = true;
+        }
+      } else if (setWeightLockCommand ||
+                 clearWeightLockCommand) {
+        const bool desiredSetCommand =
+            weightLockPhase == WeightLockPhase::Locked &&
+            lockedWeightSnapshot.scaleIncluded[event.scaleIndex];
+        const bool commandStillMatches =
+            (setWeightLockCommand && desiredSetCommand) ||
+            (clearWeightLockCommand && !desiredSetCommand);
+        weightLockSyncPending[event.scaleIndex] =
+            !success || !commandStillMatches;
+        if (weightLockSyncPending[event.scaleIndex]) {
+          weightLockSyncRetryAtMs[event.scaleIndex] =
+              millis() + WEIGHT_LOCK_SYNC_RETRY_MS;
+        }
+        Serial.printf("Scale %u weight-lock sync %s.\n",
+                      event.scaleIndex + 1,
+                      success && commandStillMatches
+                          ? "complete"
+                          : "will retry");
+      } else if (state.pendingCommand != DualScaleBle::CommandType::Status) {
+        showNotice("Scale " + String(event.scaleIndex + 1) +
+                       (success ? " command complete" : " command failed"),
+                   3000);
+      }
+      state.pendingToken = 0;
+      state.pendingCommandAtMs = 0;
+    }
+  }
+
+  recomputeCombinedWeight();
+}
+
+void adjustCalibrationWeight(float amount) {
+  calibrationWeightKg = constrain(calibrationWeightKg + amount, 0.1f, 100.0f);
+  calibrationWeightKg = roundf(calibrationWeightKg * 10.0f) / 10.0f;
+  uiDirty = true;
+}
+
+void handleDashboardTouch(const TouchSample &sample) {
+  if (pointInRect(sample.x, sample.y, 123, 7, 51, 28)) {
+    changePage(Page::Connectivity);
+    triggerConnectivityCheck();
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 181, 7, 54, 28)) {
+    changePage(Page::Settings);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 6, 256, 108, 56)) {
+    if (weightLockPhase == WeightLockPhase::Locked) {
+      unlockCombinedWeight("touchscreen UNLOCK button");
+      showNotice("Weight unlocked - re-arming", 1800);
+      return;
+    }
+
+    unlockCombinedWeight("TARE ALL");
+    bool queued[REMOTE_SCALE_COUNT] = {};
+    for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+      queued[index] =
+          queueScaleCommand(index, DualScaleBle::CommandType::Tare);
+    }
+    const uint8_t count =
+        static_cast<uint8_t>(queued[0]) +
+        static_cast<uint8_t>(queued[1]);
+    if (count == 2) {
+      showNotice("Taring both scales...");
+    } else if (count == 1) {
+      showNotice(queued[0] ? "Taring Scale 1..."
+                           : "Taring Scale 2...");
+    } else {
+      showNotice(connectedScaleCount() == 0
+                     ? "No scale connected"
+                     : "Scale command already running");
+    }
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 126, 256, 108, 56)) {
+    changePage(Page::Calibration);
+  }
+}
+
+void handleCalibrationTouch(const TouchSample &sample) {
+  if (pointInRect(sample.x, sample.y, 5, 7, 55, 28)) {
+    changePage(Page::Dashboard);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 6, 158, 111, 30)) {
+    calibrationTargetIndex = 0;
+    uiDirty = true;
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 123, 158, 111, 30)) {
+    calibrationTargetIndex = 1;
+    uiDirty = true;
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 4, 194, 55, 32)) {
+    adjustCalibrationWeight(-1.0f);
+    return;
+  }
+  if (pointInRect(sample.x, sample.y, 63, 194, 55, 32)) {
+    adjustCalibrationWeight(-0.1f);
+    return;
+  }
+  if (pointInRect(sample.x, sample.y, 122, 194, 55, 32)) {
+    adjustCalibrationWeight(0.1f);
+    return;
+  }
+  if (pointInRect(sample.x, sample.y, 181, 194, 55, 32)) {
+    adjustCalibrationWeight(1.0f);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 6, 232, 228, 36)) {
+    unlockCombinedWeight("tare command");
+    if (queueScaleCommand(calibrationTargetIndex,
+                          DualScaleBle::CommandType::Tare)) {
+      showNotice("Taring Scale " +
+                 String(calibrationTargetIndex + 1) + "...");
+    } else {
+      showNotice(scaleStates[calibrationTargetIndex].connected
+                     ? "Selected scale is busy"
+                     : "Selected scale not connected");
+    }
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 6, 276, 228, 37)) {
+    unlockCombinedWeight("calibration command");
+    const int32_t valueGrams =
+        static_cast<int32_t>(lroundf(calibrationWeightKg * 1000.0f));
+    if (!queueScaleCommand(calibrationTargetIndex,
+                           DualScaleBle::CommandType::Calibrate,
+                           valueGrams)) {
+      showNotice(scaleStates[calibrationTargetIndex].connected
+                     ? "Selected scale is busy"
+                     : "Selected scale not connected");
+      return;
+    }
+
+    changePage(Page::Dashboard);
+    showNotice("Calibrating Scale " +
+                   String(calibrationTargetIndex + 1) + "...",
+               4500);
+  }
+}
+
+void handleSettingsTouch(const TouchSample &sample) {
+  if (pointInRect(sample.x, sample.y, 5, 7, 55, 28)) {
+    changePage(Page::Dashboard);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 12, 116, 92, 34)) {
+    adjustBrightness(-BRIGHTNESS_STEP_PERCENT);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 136, 116, 92, 34)) {
+    adjustBrightness(BRIGHTNESS_STEP_PERCENT);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 12, 230, 102, 40)) {
+    selectCpuFrequency(160);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 126, 230, 102, 40)) {
+    selectCpuFrequency(240);
+  }
+}
+
+void handleConnectivityTouch(const TouchSample &sample) {
+  if (pointInRect(sample.x, sample.y, 5, 7, 55, 28)) {
+    changePage(Page::Dashboard);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 6, 278, 228, 35)) {
+    triggerConnectivityCheck();
+  }
+}
+
+void processTouch(const TouchSample &sample, bool newTouch) {
+  if (!newTouch || millis() - lastTouchActionMs < 180) {
+    return;
+  }
+  lastTouchActionMs = millis();
+
+  Serial.printf("Touch: x=%u y=%u\n", sample.x, sample.y);
+  if (currentPage == Page::Dashboard) {
+    handleDashboardTouch(sample);
+  } else if (currentPage == Page::Calibration) {
+    handleCalibrationTouch(sample);
+  } else if (currentPage == Page::Settings) {
+    handleSettingsTouch(sample);
+  } else {
+    handleConnectivityTouch(sample);
+  }
+}
+
+} // namespace
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  noticeMessage.reserve(64);
+
+  Serial.println();
+  Serial.println("Guition JC2432W328C dual BLE load-cell display");
+  Serial.println("LCD: ST7789 240x320; touch: CST820 at 0x15");
+  loadDisplaySettings();
+
+  pinMode(TFT_BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(TFT_BACKLIGHT_PIN, LOW);
+  pinMode(TOUCH_RESET_PIN, OUTPUT);
+  digitalWrite(TOUCH_RESET_PIN, LOW);
+
+  // GPIO holds survive deep sleep. Prepare LOW first, then release the holds
+  // before reinitializing the LCD and touch controller.
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis(GPIO_NUM_27);
+  gpio_hold_dis(GPIO_NUM_25);
+  beginBacklightControl();
+
+  tft.init();
+  tft.setRotation(0);
+  beginWeightSprite();
+
+  touchReady = beginTouchController();
+  drawCurrentPage();
+  // Keep the backlight off until the first complete frame is ready.
+  applyBacklightOutput(true);
+  if (!startBleManager()) {
+    showNotice("BLE manager failed", 5000);
+  }
+  lastUserActivityMs = millis();
+}
+
+void loop() {
+  processBleUiEvents();
+
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    ScaleState &state = scaleStates[index];
+    const uint32_t latestActivityMs =
+        state.lastTelemetryMs != 0
+            ? state.lastTelemetryMs
+            : state.connectedAtMs;
+    if (state.connected && latestActivityMs != 0 &&
+        millis() - latestActivityMs > TELEMETRY_RECONNECT_MS) {
+      requestBleReconnect(index);
+    }
+
+    if (state.pendingToken != 0 &&
+        state.pendingCommandAtMs != 0 &&
+        millis() - state.pendingCommandAtMs > COMMAND_ACK_TIMEOUT_MS) {
+      const bool peerStatusCommand =
+          state.pendingCommand == DualScaleBle::CommandType::PeerStatus;
+      const bool weightLockCommand =
+          state.pendingCommand == DualScaleBle::CommandType::SetWeightLock ||
+          state.pendingCommand ==
+              DualScaleBle::CommandType::ClearWeightLock;
+      state.pendingToken = 0;
+      state.pendingCommandAtMs = 0;
+      if (peerStatusCommand) {
+        peerStatusSyncPending[index] = true;
+      } else if (weightLockCommand) {
+        weightLockSyncPending[index] = true;
+        weightLockSyncRetryAtMs[index] =
+            millis() + WEIGHT_LOCK_SYNC_RETRY_MS;
+        Serial.printf("Scale %u weight-lock sync timed out; retrying.\n",
+                      index + 1);
+      } else {
+        showNotice("Scale " + String(index + 1) +
+                       " command timed out",
+                   4000);
+      }
+      requestBleReconnect(index);
+    }
+  }
+  recomputeCombinedWeight();
+  serviceAutomaticWeightLock();
+  serviceWeightLockSync();
+  servicePeerStatusSync();
+
+  if (!noticeMessage.isEmpty() && !noticeActive()) {
+    noticeMessage = "";
+    dashboardStatusDirty = true;
+    uiDirty = true;
+  }
+
+  if (touchReady) {
+    TouchSample sample;
+    const bool touched = readTouch(sample);
+    if (touched) {
+      lastUserActivityMs = millis();
+      if (screenSleeping) {
+        setScreenSleeping(false);
+        Serial.println("Screen standby ended by touchscreen activity.");
+      } else if (idleWarningActive) {
+        idleWarningActive = false;
+        idleWarningSecondsShown = 0;
+        pageDirty = true;
+        uiDirty = true;
+        Serial.println("Idle standby cancelled by touchscreen activity.");
+      } else {
+        processTouch(sample, !touchWasDown);
+      }
+    }
+    touchWasDown = touched;
+  }
+
+  if (currentPage == Page::Connectivity && !screenSleeping &&
+      millis() - lastConnectivityRedrawMs >= 1000) {
+    lastConnectivityRedrawMs = millis();
+    uiDirty = true;
+  }
+
+  if (!screenSleeping) {
+    const uint32_t idleTimeMs = millis() - lastUserActivityMs;
+    if (idleTimeMs >= SCREEN_TIMEOUT_MS) {
+      setScreenSleeping(true);
+    } else if (idleTimeMs >= SCREEN_TIMEOUT_MS - SCREEN_IDLE_WARNING_MS) {
+      const uint32_t remainingMs = SCREEN_TIMEOUT_MS - idleTimeMs;
+      const uint8_t secondsRemaining =
+          static_cast<uint8_t>((remainingMs + 999) / 1000);
+
+      if (!idleWarningActive ||
+          secondsRemaining != idleWarningSecondsShown) {
+        const bool enteringIdleWarning = !idleWarningActive;
+        if (enteringIdleWarning) {
+          Serial.println("Screen idle: showing standby warning.");
+        }
+        idleWarningActive = true;
+        idleWarningSecondsShown = secondsRemaining;
+        if (enteringIdleWarning) {
+          drawIdleWarning(secondsRemaining);
+        } else {
+          drawIdleWarningCountdown(secondsRemaining);
+        }
+      }
+    }
+  }
+
+  if (!screenSleeping && !idleWarningActive) {
+    if (pageDirty) {
+      drawCurrentPage();
+    } else if (uiDirty) {
+      updateCurrentPage();
+    }
+    serviceDashboardScaleBorderAnimation();
+  }
+
+  delay(12);
+}
