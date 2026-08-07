@@ -47,6 +47,7 @@ constexpr uint8_t MAX_BRIGHTNESS_PERCENT = 100;
 constexpr uint8_t BRIGHTNESS_STEP_PERCENT = 10;
 constexpr uint8_t DEFAULT_BRIGHTNESS_PERCENT = 100;
 constexpr uint16_t DEFAULT_CPU_FREQUENCY_MHZ = 240;
+constexpr uint8_t WEB_MODE_MAX_BRIGHTNESS_PERCENT = 20;
 
 // The phone connects directly to this access point. Internet and a router are
 // not required; the touchscreen remains the only BLE master for both scales.
@@ -56,6 +57,8 @@ constexpr uint8_t PHONE_WIFI_CHANNEL = 6;
 constexpr uint8_t PHONE_WIFI_MAX_CLIENTS = 2;
 constexpr uint32_t PHONE_CLIENT_CHECK_INTERVAL_MS = 1000;
 constexpr uint32_t PHONE_ACTION_MIN_INTERVAL_MS = 250;
+constexpr uint32_t PHONE_WEB_ACTIVITY_LIVE_MS = 5000;
+constexpr uint32_t PHONE_WIFI_STOP_DELAY_MS = 1500;
 constexpr uint8_t HISTORY_PAGE_DEFAULT_LIMIT = 10;
 constexpr uint8_t HISTORY_PAGE_MAX_LIMIT = 20;
 constexpr uint64_t HISTORY_MIN_TIMESTAMP_MS = 1577836800000ULL;
@@ -67,6 +70,7 @@ constexpr char LOCAL_BLUETOOTH_NAME[] = "LOAD_CELL_DISPLAY";
 constexpr char SETTINGS_NAMESPACE[] = "display_ui";
 constexpr char BRIGHTNESS_KEY[] = "brightness";
 constexpr char CPU_FREQUENCY_KEY[] = "cpu_mhz";
+constexpr char OPERATING_MODE_KEY[] = "op_mode";
 constexpr uint32_t RECONNECT_INTERVAL_MS = 3000;
 constexpr uint32_t BLE_CONNECT_TIMEOUT_MS = 5000;
 constexpr uint32_t BLE_SCAN_WINDOW_MS = 4000;
@@ -78,6 +82,7 @@ constexpr uint32_t DUAL_SAMPLE_MAX_SKEW_MS = 1000;
 constexpr uint32_t COMMAND_ACK_TIMEOUT_MS = 12000;
 constexpr uint8_t REQUIRED_GOOD_PACKETS = 2;
 constexpr uint32_t SCREEN_TIMEOUT_MS = 30000;
+constexpr uint32_t WEB_MODE_SCREEN_TIMEOUT_MS = 20000;
 constexpr uint32_t SCREEN_IDLE_WARNING_MS = 3000;
 constexpr int32_t WEIGHT_LOCK_THRESHOLD_GRAMS = 3000;
 constexpr uint32_t WEIGHT_LOCK_SETTLE_MS = 2500;
@@ -154,6 +159,14 @@ enum class Page {
   Calibration,
   Settings,
   Connectivity,
+  ModeSelection,
+  WebStatus,
+};
+
+enum class OperatingMode : uint8_t {
+  Local = 0,
+  Web = 1,
+  Hybrid = 2,
 };
 
 enum class CalibrationRepeatPhase : uint8_t {
@@ -171,6 +184,8 @@ bool backlightPwmReady = false;
 bool settingsPreferencesReady = false;
 bool bluetoothReady = false;
 bool phoneControlReady = false;
+bool phoneRoutesConfigured = false;
+bool phoneWifiStopPending = false;
 bool weightValid = false;
 bool pageDirty = true;
 bool uiDirty = true;
@@ -192,6 +207,7 @@ uint8_t activeCalibrationAdjustButton = NO_CALIBRATION_ADJUST_BUTTON;
 uint32_t nextCalibrationRepeatAtMs = 0;
 
 Page currentPage = Page::Dashboard;
+OperatingMode operatingMode = OperatingMode::Hybrid;
 float latestWeightKg = 0.0f;
 float calibrationWeightKg = 1.0f;
 uint8_t brightnessPercent = DEFAULT_BRIGHTNESS_PERCENT;
@@ -205,11 +221,19 @@ uint32_t noticeUntilMs = 0;
 uint32_t lastConnectivityRedrawMs = 0;
 uint32_t lastPhoneClientCheckMs = 0;
 uint32_t lastPhoneActionMs = 0;
+uint32_t lastPhoneWebActivityMs = 0;
+uint32_t phoneWifiStopAtMs = 0;
+uint32_t lastWebStatusRedrawMs = 0;
 uint8_t phoneClientCount = 0;
 uint8_t idleWarningSecondsShown = 0;
 uint32_t currentWeightLockToken = 0;
 bool currentWeightLockSaved = false;
 uint32_t currentWeightLockRecordId = 0;
+
+void configurePhoneRoutes();
+bool beginPhoneControl();
+void stopPhoneControl();
+void applyOperatingMode(OperatingMode mode, bool requestedFromPhone = false);
 
 enum class CombinedMode : uint8_t {
   None,
@@ -953,13 +977,58 @@ void changePage(Page page) {
   uiDirty = true;
 }
 
+bool supportedOperatingMode(uint8_t value) {
+  return value <= static_cast<uint8_t>(OperatingMode::Hybrid);
+}
+
+const char *operatingModeName(OperatingMode mode) {
+  switch (mode) {
+  case OperatingMode::Local:
+    return "LOCAL";
+  case OperatingMode::Web:
+    return "WEB";
+  case OperatingMode::Hybrid:
+  default:
+    return "HYBRID";
+  }
+}
+
+const char *operatingModeApiName(OperatingMode mode) {
+  switch (mode) {
+  case OperatingMode::Local:
+    return "local";
+  case OperatingMode::Web:
+    return "web";
+  case OperatingMode::Hybrid:
+  default:
+    return "hybrid";
+  }
+}
+
+bool operatingModeUsesWifi(OperatingMode mode) {
+  return mode != OperatingMode::Local;
+}
+
+uint32_t activeScreenTimeoutMs() {
+  return operatingMode == OperatingMode::Web
+             ? WEB_MODE_SCREEN_TIMEOUT_MS
+             : SCREEN_TIMEOUT_MS;
+}
+
 bool supportedCpuFrequency(uint16_t frequencyMhz) {
   return frequencyMhz == 160 || frequencyMhz == 240;
 }
 
+uint8_t effectiveBrightnessPercent() {
+  return operatingMode == OperatingMode::Web
+             ? min(brightnessPercent, WEB_MODE_MAX_BRIGHTNESS_PERCENT)
+             : brightnessPercent;
+}
+
 uint8_t brightnessDutyCycle() {
+  const uint8_t effectiveBrightness = effectiveBrightnessPercent();
   return static_cast<uint8_t>(
-      (static_cast<uint16_t>(brightnessPercent) * 255U + 50U) / 100U);
+      (static_cast<uint16_t>(effectiveBrightness) * 255U + 50U) / 100U);
 }
 
 void applyBacklightOutput(bool enabled) {
@@ -1007,6 +1076,15 @@ void loadDisplaySettings() {
                           ? storedCpuFrequency
                           : DEFAULT_CPU_FREQUENCY_MHZ;
 
+    const uint8_t storedOperatingMode =
+        settingsPreferences.getUChar(
+            OPERATING_MODE_KEY,
+            static_cast<uint8_t>(OperatingMode::Hybrid));
+    operatingMode =
+        supportedOperatingMode(storedOperatingMode)
+            ? static_cast<OperatingMode>(storedOperatingMode)
+            : OperatingMode::Hybrid;
+
   }
 
   if (!setCpuFrequencyMhz(cpuFrequencyMhz)) {
@@ -1016,6 +1094,8 @@ void loadDisplaySettings() {
 
   Serial.printf("Display brightness: %u%%\n", brightnessPercent);
   Serial.printf("CPU frequency: %u MHz\n", cpuFrequencyMhz);
+  Serial.print("Operating mode: ");
+  Serial.println(operatingModeName(operatingMode));
 }
 
 void adjustBrightness(int amountPercent) {
@@ -1643,21 +1723,15 @@ void drawSettingsDynamic() {
              cpuFrequencyMhz == 240 ? COLOR_PRIMARY : COLOR_MUTED,
              1);
 
-  tft.fillRect(0, 283, SCREEN_WIDTH, 37, COLOR_BACKGROUND);
-  const String footerText =
-      noticeActive() ? noticeMessage : "Settings save automatically";
-  setCenteredText(footerText,
-                  SCREEN_WIDTH / 2,
-                  295,
-                  1,
-                  noticeActive() ? COLOR_WARNING : COLOR_MUTED,
-                  COLOR_BACKGROUND);
-  setCenteredText("Lower settings can reduce heat",
-                  SCREEN_WIDTH / 2,
-                  311,
-                  1,
-                  COLOR_MUTED,
-                  COLOR_BACKGROUND);
+  tft.fillRect(0, 282, SCREEN_WIDTH, 38, COLOR_BACKGROUND);
+  drawButton(6,
+             284,
+             228,
+             31,
+             "MODE: " + String(operatingModeName(operatingMode)),
+             COLOR_PANEL_LIGHT,
+             COLOR_PRIMARY,
+             1);
 }
 
 void drawSettingsPage() {
@@ -1693,6 +1767,60 @@ void drawSettingsPage() {
   tft.print("ESP32 CPU CLOCK");
 
   drawSettingsDynamic();
+}
+
+void drawOperatingModeChoice(OperatingMode mode,
+                             int16_t y,
+                             const String &title,
+                             const String &description) {
+  const bool selected = operatingMode == mode;
+  const uint16_t fill = selected ? COLOR_PRIMARY : COLOR_PANEL;
+  const uint16_t border = selected ? COLOR_PRIMARY : COLOR_PANEL_LIGHT;
+  tft.fillRoundRect(6, y, 228, 68, 9, fill);
+  tft.drawRoundRect(6, y, 228, 68, 9, border);
+  setCenteredText(title,
+                  SCREEN_WIDTH / 2,
+                  y + 23,
+                  2,
+                  TFT_WHITE,
+                  fill);
+  setCenteredText(description,
+                  SCREEN_WIDTH / 2,
+                  y + 49,
+                  1,
+                  selected ? TFT_WHITE : COLOR_MUTED,
+                  fill);
+}
+
+void drawOperatingModeSelectionPage() {
+  tft.fillScreen(COLOR_BACKGROUND);
+  drawHeader("SELECT MODE", true);
+  drawOperatingModeChoice(OperatingMode::Local,
+                          51,
+                          "LOCAL",
+                          "Touchscreen only - WiFi off");
+  drawOperatingModeChoice(OperatingMode::Web,
+                          127,
+                          "WEB APP",
+                          "Phone control - status screen");
+  drawOperatingModeChoice(OperatingMode::Hybrid,
+                          203,
+                          "HYBRID",
+                          "Touchscreen and phone control");
+  const String footer =
+      noticeActive() ? noticeMessage : "BLE scales stay active in every mode";
+  setCenteredText(footer,
+                  SCREEN_WIDTH / 2,
+                  292,
+                  1,
+                  noticeActive() ? COLOR_WARNING : COLOR_MUTED,
+                  COLOR_BACKGROUND);
+  setCenteredText("Selection saves automatically",
+                  SCREEN_WIDTH / 2,
+                  308,
+                  1,
+                  COLOR_MUTED,
+                  COLOR_BACKGROUND);
 }
 
 String scaleLinkLabel(uint8_t index) {
@@ -1805,6 +1933,119 @@ uint16_t scaleAgeColor(uint8_t index) {
   return millis() - scaleStates[index].lastTelemetryMs <= TELEMETRY_STALE_MS
              ? COLOR_SUCCESS
              : COLOR_DANGER;
+}
+
+bool phoneWebAppActive() {
+  return phoneControlReady && phoneClientCount > 0 &&
+         lastPhoneWebActivityMs != 0 &&
+         millis() - lastPhoneWebActivityMs <= PHONE_WEB_ACTIVITY_LIVE_MS;
+}
+
+void drawWebStatusRow(int16_t y,
+                      const String &label,
+                      const String &value,
+                      uint16_t valueColor) {
+  tft.fillRect(14, y - 7, 212, 15, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  tft.setCursor(16, y - 4);
+  tft.print(label);
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextColor(valueColor, COLOR_PANEL);
+  tft.drawString(value, 224, y, 1);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void drawWebStatusDynamic() {
+  const String phoneValue =
+      !phoneControlReady
+          ? "WIFI ERROR"
+          : phoneClientCount == 0
+                ? "WAITING"
+                : String(phoneClientCount) + " CONNECTED";
+  const uint16_t phoneColor =
+      !phoneControlReady
+          ? COLOR_DANGER
+          : phoneClientCount > 0 ? COLOR_SUCCESS : COLOR_WARNING;
+  drawWebStatusRow(190, "PHONES", phoneValue, phoneColor);
+
+  const bool appActive = phoneWebAppActive();
+  drawWebStatusRow(210,
+                   "WEB APP",
+                   appActive ? "DATA ACTIVE" : "NOT OPEN",
+                   appActive ? COLOR_SUCCESS : COLOR_WARNING);
+
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    String value = scaleDataLabel(index);
+    if (value == "LIVE") {
+      value += "  ";
+      value += scaleAgeLabel(index);
+    }
+    drawWebStatusRow(230 + index * 20,
+                     "LOAD CELL " + String(index == 0 ? "A" : "B"),
+                     value,
+                     scaleDataColor(index));
+  }
+}
+
+void drawWebStatusPage() {
+  tft.fillScreen(COLOR_BACKGROUND);
+  drawHeader("WEB MODE", false);
+
+  tft.fillRoundRect(6, 51, 228, 106, 9, COLOR_PANEL);
+  setCenteredText("CONNECT YOUR PHONE",
+                  SCREEN_WIDTH / 2,
+                  64,
+                  1,
+                  COLOR_MUTED,
+                  COLOR_PANEL);
+  setCenteredText(PHONE_WIFI_SSID,
+                  SCREEN_WIDTH / 2,
+                  85,
+                  2,
+                  TFT_WHITE,
+                  COLOR_PANEL);
+  String webAddress = "http://";
+  webAddress += phoneControlReady
+                    ? WiFi.softAPIP().toString()
+                    : String("192.168.4.1");
+  setCenteredText(webAddress,
+                  SCREEN_WIDTH / 2,
+                  112,
+                  1,
+                  COLOR_PRIMARY,
+                  COLOR_PANEL);
+  setCenteredText("Password: " + String(PHONE_WIFI_PASSWORD),
+                  SCREEN_WIDTH / 2,
+                  137,
+                  1,
+                  COLOR_MUTED,
+                  COLOR_PANEL);
+
+  tft.fillRoundRect(6, 166, 228, 96, 9, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  tft.setCursor(16, 174);
+  tft.print("LIVE STATUS");
+  drawWebStatusDynamic();
+
+  drawButton(6,
+             271,
+             108,
+             42,
+             "MODE",
+             COLOR_PANEL_LIGHT,
+             COLOR_PRIMARY,
+             1);
+  drawButton(126,
+             271,
+             108,
+             42,
+             "SCREEN OFF",
+             COLOR_PANEL_LIGHT,
+             COLOR_MUTED,
+             1);
+  lastWebStatusRedrawMs = millis();
 }
 
 void drawConnectivityItem(int16_t centerX,
@@ -1972,8 +2213,12 @@ void drawCurrentPage() {
     drawCalibrationPage();
   } else if (currentPage == Page::Settings) {
     drawSettingsPage();
-  } else {
+  } else if (currentPage == Page::Connectivity) {
     drawConnectivityPage();
+  } else if (currentPage == Page::ModeSelection) {
+    drawOperatingModeSelectionPage();
+  } else if (currentPage == Page::WebStatus) {
+    drawWebStatusPage();
   }
   pageDirty = false;
   uiDirty = false;
@@ -1986,8 +2231,13 @@ void updateCurrentPage() {
     drawCalibrationDynamic();
   } else if (currentPage == Page::Settings) {
     drawSettingsDynamic();
-  } else {
+  } else if (currentPage == Page::Connectivity) {
     drawConnectivityDynamic();
+  } else if (currentPage == Page::ModeSelection) {
+    drawOperatingModeSelectionPage();
+  } else if (currentPage == Page::WebStatus) {
+    drawWebStatusDynamic();
+    lastWebStatusRedrawMs = millis();
   }
   uiDirty = false;
 }
@@ -3251,6 +3501,11 @@ void handleSettingsTouch(const TouchSample &sample) {
 
   if (pointInRect(sample.x, sample.y, 126, 230, 102, 40)) {
     selectCpuFrequency(240);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 6, 284, 228, 31)) {
+    changePage(Page::ModeSelection);
   }
 }
 
@@ -3262,6 +3517,36 @@ void handleConnectivityTouch(const TouchSample &sample) {
 
   if (pointInRect(sample.x, sample.y, 6, 278, 228, 35)) {
     triggerConnectivityCheck();
+  }
+}
+
+void handleOperatingModeTouch(const TouchSample &sample) {
+  if (pointInRect(sample.x, sample.y, 5, 7, 55, 28)) {
+    changePage(operatingMode == OperatingMode::Web
+                   ? Page::WebStatus
+                   : Page::Settings);
+    return;
+  }
+  if (pointInRect(sample.x, sample.y, 6, 51, 228, 68)) {
+    applyOperatingMode(OperatingMode::Local);
+    return;
+  }
+  if (pointInRect(sample.x, sample.y, 6, 127, 228, 68)) {
+    applyOperatingMode(OperatingMode::Web);
+    return;
+  }
+  if (pointInRect(sample.x, sample.y, 6, 203, 228, 68)) {
+    applyOperatingMode(OperatingMode::Hybrid);
+  }
+}
+
+void handleWebStatusTouch(const TouchSample &sample) {
+  if (pointInRect(sample.x, sample.y, 6, 271, 108, 42)) {
+    changePage(Page::ModeSelection);
+    return;
+  }
+  if (pointInRect(sample.x, sample.y, 126, 271, 108, 42)) {
+    setScreenSleeping(true);
   }
 }
 
@@ -3278,8 +3563,12 @@ void processTouch(const TouchSample &sample, bool newTouch) {
     handleCalibrationTouch(sample);
   } else if (currentPage == Page::Settings) {
     handleSettingsTouch(sample);
-  } else {
+  } else if (currentPage == Page::Connectivity) {
     handleConnectivityTouch(sample);
+  } else if (currentPage == Page::ModeSelection) {
+    handleOperatingModeTouch(sample);
+  } else if (currentPage == Page::WebStatus) {
+    handleWebStatusTouch(sample);
   }
 }
 
@@ -3386,11 +3675,19 @@ void sendPhoneMessage(int statusCode,
   sendPhoneJson(statusCode, json);
 }
 
+void notePhoneWebActivity() {
+  lastPhoneWebActivityMs = millis();
+  if (currentPage == Page::WebStatus) {
+    uiDirty = true;
+  }
+}
+
 bool validatePhonePost() {
   if (phoneWebServer.header("X-Scale-Control") != "1") {
     sendPhoneMessage(403, false, "Control request was not authorized");
     return false;
   }
+  notePhoneWebActivity();
 
   const uint32_t now = millis();
   if (lastPhoneActionMs != 0 &&
@@ -3656,6 +3953,7 @@ bool parsePhoneCalibrationGrams(const String &argument,
 }
 
 void handlePhoneRoot() {
+  notePhoneWebActivity();
   phoneWebServer.sendHeader("Cache-Control", "no-store, max-age=0");
   phoneWebServer.sendHeader("X-Content-Type-Options", "nosniff");
   phoneWebServer.sendHeader(
@@ -3666,6 +3964,7 @@ void handlePhoneRoot() {
 }
 
 void handlePhoneStatus() {
+  notePhoneWebActivity();
   static String json;
   // reserve() is a no-op after the retained String buffer reaches this size.
   json.reserve(3200);
@@ -3674,7 +3973,11 @@ void handlePhoneStatus() {
   json += static_cast<unsigned long>(millis());
   json += ",\"freeHeap\":";
   json += static_cast<unsigned long>(ESP.getFreeHeap());
-  json += ",\"wifi\":{\"ssid\":";
+  json += ",\"operatingMode\":";
+  appendJsonString(json, operatingModeApiName(operatingMode));
+  json += ",\"wifi\":{\"enabled\":";
+  appendJsonBool(json, phoneControlReady);
+  json += ",\"ssid\":";
   appendJsonString(json, PHONE_WIFI_SSID);
   json += ",\"ip\":";
   appendJsonString(json, WiFi.softAPIP().toString());
@@ -3755,6 +4058,8 @@ void handlePhoneStatus() {
 
   json += ",\"display\":{\"brightness\":";
   json += static_cast<unsigned int>(brightnessPercent);
+  json += ",\"effectiveBrightness\":";
+  json += static_cast<unsigned int>(effectiveBrightnessPercent());
   json += ",\"cpuMHz\":";
   json += cpuFrequencyMhz;
   json += ",\"sleeping\":";
@@ -4499,6 +4804,53 @@ void handlePhoneCpuFrequency() {
                            : "CPU clock change failed");
 }
 
+bool parsePhoneOperatingMode(const String &argument,
+                             OperatingMode &mode) {
+  String value = argument;
+  value.trim();
+  value.toLowerCase();
+  if (value == "local") {
+    mode = OperatingMode::Local;
+    return true;
+  }
+  if (value == "web") {
+    mode = OperatingMode::Web;
+    return true;
+  }
+  if (value == "hybrid") {
+    mode = OperatingMode::Hybrid;
+    return true;
+  }
+  return false;
+}
+
+void handlePhoneOperatingMode() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  OperatingMode requestedMode = operatingMode;
+  if (!phoneWebServer.hasArg("mode") ||
+      !parsePhoneOperatingMode(phoneWebServer.arg("mode"),
+                               requestedMode)) {
+    sendPhoneMessage(400,
+                     false,
+                     "Mode must be local, web, or hybrid");
+    return;
+  }
+
+  applyOperatingMode(requestedMode, true);
+  if (operatingMode != requestedMode) {
+    sendPhoneMessage(500, false, "Mode change failed");
+    return;
+  }
+  sendPhoneMessage(
+      requestedMode == OperatingMode::Local ? 202 : 200,
+      true,
+      requestedMode == OperatingMode::Local
+          ? "Local mode enabled; WiFi will turn off now"
+          : String(operatingModeName(requestedMode)) + " mode enabled");
+}
+
 void handlePhoneNotFound() {
   if (phoneWebServer.uri().startsWith("/api/")) {
     sendPhoneMessage(404, false, "API endpoint not found");
@@ -4509,25 +4861,10 @@ void handlePhoneNotFound() {
   phoneWebServer.send(302, "text/plain", "Open the weighing-scale control page");
 }
 
-void beginPhoneControl() {
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_AP);
-  const IPAddress address(192, 168, 4, 1);
-  const IPAddress gateway(192, 168, 4, 1);
-  const IPAddress subnet(255, 255, 255, 0);
-  if (!WiFi.softAPConfig(address, gateway, subnet)) {
-    Serial.println("Warning: phone-control SoftAP IP configuration failed.");
-  }
-  if (!WiFi.softAP(PHONE_WIFI_SSID,
-                   PHONE_WIFI_PASSWORD,
-                   PHONE_WIFI_CHANNEL,
-                   false,
-                   PHONE_WIFI_MAX_CLIENTS)) {
-    Serial.println("ERROR: Phone-control Wi-Fi access point failed to start.");
-    phoneControlReady = false;
+void configurePhoneRoutes() {
+  if (phoneRoutesConfigured) {
     return;
   }
-
   const char *collectedHeaders[] = {"X-Scale-Control"};
   phoneWebServer.collectHeaders(collectedHeaders, 1);
   phoneWebServer.on("/", HTTP_GET, handlePhoneRoot);
@@ -4561,12 +4898,48 @@ void beginPhoneControl() {
   phoneWebServer.on("/api/v1/display/cpu",
                     HTTP_POST,
                     handlePhoneCpuFrequency);
+  phoneWebServer.on("/api/v1/mode",
+                    HTTP_POST,
+                    handlePhoneOperatingMode);
   phoneWebServer.on("/favicon.ico", HTTP_GET, []() {
     phoneWebServer.send(204, "image/x-icon", "");
   });
   phoneWebServer.onNotFound(handlePhoneNotFound);
+  phoneRoutesConfigured = true;
+}
+
+bool beginPhoneControl() {
+  if (phoneControlReady) {
+    return true;
+  }
+  configurePhoneRoutes();
+  WiFi.persistent(false);
+  if (!WiFi.mode(WIFI_AP)) {
+    Serial.println("ERROR: Could not enable Wi-Fi AP mode.");
+    return false;
+  }
+  const IPAddress address(192, 168, 4, 1);
+  const IPAddress gateway(192, 168, 4, 1);
+  const IPAddress subnet(255, 255, 255, 0);
+  if (!WiFi.softAPConfig(address, gateway, subnet)) {
+    Serial.println("Warning: phone-control SoftAP IP configuration failed.");
+  }
+  if (!WiFi.softAP(PHONE_WIFI_SSID,
+                   PHONE_WIFI_PASSWORD,
+                   PHONE_WIFI_CHANNEL,
+                   false,
+                   PHONE_WIFI_MAX_CLIENTS)) {
+    Serial.println("ERROR: Phone-control Wi-Fi access point failed to start.");
+    phoneControlReady = false;
+    WiFi.mode(WIFI_OFF);
+    return false;
+  }
   phoneWebServer.begin();
   phoneControlReady = true;
+  phoneClientCount = 0;
+  lastPhoneClientCheckMs = 0;
+  lastPhoneWebActivityMs = 0;
+  lastPhoneActionMs = 0;
 
   Serial.println("Phone control Wi-Fi ready.");
   Serial.print("  Network: ");
@@ -4575,9 +4948,78 @@ void beginPhoneControl() {
   Serial.println(PHONE_WIFI_PASSWORD);
   Serial.print("  Open: http://");
   Serial.println(WiFi.softAPIP());
+  return true;
+}
+
+void stopPhoneControl() {
+  phoneWifiStopPending = false;
+  phoneWifiStopAtMs = 0;
+  if (phoneControlReady) {
+    phoneWebServer.stop();
+  }
+  phoneControlReady = false;
+  phoneClientCount = 0;
+  lastPhoneClientCheckMs = 0;
+  lastPhoneWebActivityMs = 0;
+  lastPhoneActionMs = 0;
+  WiFi.softAPdisconnect(true);
+  if (WiFi.getMode() != WIFI_OFF) {
+    WiFi.mode(WIFI_OFF);
+  }
+  Serial.println("Phone control Wi-Fi stopped; BLE scales remain active.");
+}
+
+void applyOperatingMode(OperatingMode requestedMode,
+                        bool requestedFromPhone) {
+  const OperatingMode previousMode = operatingMode;
+  phoneWifiStopPending = false;
+  phoneWifiStopAtMs = 0;
+
+  if (operatingModeUsesWifi(requestedMode) &&
+      !beginPhoneControl()) {
+    operatingMode = previousMode;
+    showNotice("WiFi could not start", 4500);
+    return;
+  }
+
+  operatingMode = requestedMode;
+  if (settingsPreferencesReady &&
+      settingsPreferences.putUChar(
+          OPERATING_MODE_KEY,
+          static_cast<uint8_t>(operatingMode)) != 1) {
+    Serial.println("Warning: operating mode could not be saved.");
+  }
+
+  if (operatingMode == OperatingMode::Local) {
+    if (requestedFromPhone && phoneControlReady) {
+      phoneWifiStopPending = true;
+      phoneWifiStopAtMs = millis() + PHONE_WIFI_STOP_DELAY_MS;
+    } else {
+      stopPhoneControl();
+    }
+    changePage(Page::Dashboard);
+  } else if (operatingMode == OperatingMode::Web) {
+    changePage(Page::WebStatus);
+  } else {
+    changePage(Page::Dashboard);
+  }
+
+  lastUserActivityMs = millis();
+  idleWarningActive = false;
+  idleWarningSecondsShown = 0;
+  pageDirty = true;
+  uiDirty = true;
+  applyBacklightOutput(!screenSleeping);
+  Serial.print("Operating mode changed to ");
+  Serial.println(operatingModeName(operatingMode));
 }
 
 void servicePhoneControl() {
+  if (phoneWifiStopPending &&
+      static_cast<int32_t>(millis() - phoneWifiStopAtMs) >= 0) {
+    stopPhoneControl();
+    return;
+  }
   if (!phoneControlReady) {
     return;
   }
@@ -4590,6 +5032,9 @@ void servicePhoneControl() {
     if (connectedClients != phoneClientCount) {
       phoneClientCount = connectedClients;
       Serial.printf("Phone-control clients: %u.\n", phoneClientCount);
+      if (currentPage == Page::WebStatus) {
+        uiDirty = true;
+      }
     }
   }
   phoneWebServer.handleClient();
@@ -4624,6 +5069,16 @@ void setup() {
   beginWeightSprite();
 
   touchReady = beginTouchController();
+  if (!touchReady && operatingMode == OperatingMode::Local) {
+    // Recovery path: a saved Wi-Fi-off mode must never leave the product with
+    // neither a working touchscreen nor a reachable phone interface.
+    operatingMode = OperatingMode::Hybrid;
+    Serial.println(
+        "Touch unavailable in Local mode; enabling Hybrid for this boot.");
+  }
+  currentPage = operatingMode == OperatingMode::Web
+                    ? Page::WebStatus
+                    : Page::Dashboard;
   drawCurrentPage();
   // Keep the backlight off until the first complete frame is ready.
   applyBacklightOutput(true);
@@ -4641,7 +5096,17 @@ void setup() {
   if (currentWeightLockToken == 0) {
     currentWeightLockToken = 1;
   }
-  beginPhoneControl();
+  if (operatingModeUsesWifi(operatingMode)) {
+    if (!beginPhoneControl()) {
+      showNotice("Phone WiFi failed", 5000);
+    }
+  } else {
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("Local mode: phone-control Wi-Fi is off.");
+  }
+  pageDirty = true;
+  uiDirty = true;
   if (!startBleManager()) {
     showNotice("BLE manager failed", 5000);
   }
@@ -4730,13 +5195,19 @@ void loop() {
     lastConnectivityRedrawMs = millis();
     uiDirty = true;
   }
+  if (currentPage == Page::WebStatus && !screenSleeping &&
+      millis() - lastWebStatusRedrawMs >= 1000) {
+    lastWebStatusRedrawMs = millis();
+    uiDirty = true;
+  }
 
   if (!screenSleeping) {
+    const uint32_t screenTimeoutMs = activeScreenTimeoutMs();
     const uint32_t idleTimeMs = millis() - lastUserActivityMs;
-    if (idleTimeMs >= SCREEN_TIMEOUT_MS) {
+    if (idleTimeMs >= screenTimeoutMs) {
       setScreenSleeping(true);
-    } else if (idleTimeMs >= SCREEN_TIMEOUT_MS - SCREEN_IDLE_WARNING_MS) {
-      const uint32_t remainingMs = SCREEN_TIMEOUT_MS - idleTimeMs;
+    } else if (idleTimeMs >= screenTimeoutMs - SCREEN_IDLE_WARNING_MS) {
+      const uint32_t remainingMs = screenTimeoutMs - idleTimeMs;
       const uint8_t secondsRemaining =
           static_cast<uint8_t>((remainingMs + 999) / 1000);
 

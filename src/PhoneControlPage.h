@@ -75,6 +75,7 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
     input[type=range] { width:100%; accent-color:var(--cyan); }
     .settings-row { display:grid; grid-template-columns:1fr auto; align-items:center; gap:14px; margin:14px 0; }
     .cpu { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .mode-controls { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; }
     #message { display:none; position:sticky; bottom:12px; z-index:4; margin-top:12px; padding:12px 14px; border-radius:11px; background:#163943; border:1px solid var(--cyan); box-shadow:0 8px 28px #0008; }
     #message.bad { border-color:var(--red); color:#ffd9dc; }
     .tabs { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:12px; }
@@ -170,6 +171,11 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
         <div class="cpu"><button id="cpu160" class="secondary" onclick="setCpu(160)">160 MHz</button><button id="cpu240" class="secondary" onclick="setCpu(240)">240 MHz</button></div>
         <div class="small" style="margin-top:11px">160 MHz generally runs cooler while keeping weighing active.</div>
       </article>
+      <article class="card">
+        <h2>OPERATING MODE</h2>
+        <div class="mode-controls"><button id="modeLocal" class="secondary" onclick="setOperatingMode('local')">LOCAL</button><button id="modeWeb" class="secondary" onclick="setOperatingMode('web')">WEB</button><button id="modeHybrid" class="secondary" onclick="setOperatingMode('hybrid')">HYBRID</button></div>
+        <div id="modeText" class="small" style="margin-top:11px">Hybrid keeps touchscreen and phone control active.</div>
+      </article>
     </section>
     </div>
 
@@ -259,16 +265,32 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
       byId('historyTab').textContent = 'HISTORY (' + history.count + ')';
       byId('historyTab').disabled = !history.ready;
       byId('saveLog').disabled = requestRunning || !history.canSaveCurrentLock;
+      const operatingMode = s.operatingMode || 'hybrid';
       const brightness = byId('brightness');
       if (document.activeElement !== brightness) {
         brightness.value = s.display.brightness;
-        byId('brightnessText').textContent = s.display.brightness + '%';
+        const effectiveBrightness = s.display.effectiveBrightness ?? s.display.brightness;
+        byId('brightnessText').textContent =
+          operatingMode === 'web' && effectiveBrightness !== s.display.brightness
+            ? effectiveBrightness + '% active (' + s.display.brightness + '% saved)'
+            : s.display.brightness + '%';
       }
       brightness.disabled = requestRunning;
       byId('cpu160').className = s.display.cpuMHz === 160 ? '' : 'secondary';
       byId('cpu240').className = s.display.cpuMHz === 240 ? '' : 'secondary';
       byId('cpu160').disabled = requestRunning;
       byId('cpu240').disabled = requestRunning;
+      ['local','web','hybrid'].forEach(mode => {
+        const button = byId('mode' + mode.charAt(0).toUpperCase() + mode.slice(1));
+        button.className = operatingMode === mode ? '' : 'secondary';
+        button.disabled = requestRunning;
+      });
+      byId('modeText').textContent =
+        operatingMode === 'local'
+          ? 'Touchscreen control only. Wi-Fi is off for lower heat and power.'
+          : operatingMode === 'web'
+              ? 'Phone control active. The status-only touchscreen is capped at 20% brightness.'
+              : 'Touchscreen and phone controls are both active.';
       if (s.notice && s.notice !== lastMasterNotice) {
         showMessage(s.notice, /failed|error|timed out|not connected|busy/i.test(s.notice));
       }
@@ -297,7 +319,7 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
         networkState(false, 'Connection lost');
       }
     }
-    async function post(path, values={}, confirmation='') {
+    async function post(path, values={}, confirmation='', refreshAfter=true) {
       if (requestRunning) return {ok:false,cancelled:true};
       if (confirmation && !confirm(confirmation)) return {ok:false,cancelled:true};
       requestRunning = true;
@@ -317,7 +339,8 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
         outcome = {ok:false,error};
       } finally {
         requestRunning = false;
-        await refresh();
+        if (refreshAfter) await refresh();
+        else if (currentState) render(currentState);
       }
       return outcome;
     }
@@ -338,6 +361,17 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
     function checkLinks() { post('/api/v1/reconnect', {target:'all'}); }
     function setBrightness(percent) { post('/api/v1/display/brightness', {percent}); }
     function setCpu(mhz) { post('/api/v1/display/cpu', {mhz}); }
+    async function setOperatingMode(mode) {
+      const local = mode === 'local';
+      const confirmation = local
+        ? 'Local mode turns off this Wi-Fi connection. Continue?'
+        : 'Switch the touchscreen to ' + mode.toUpperCase() + ' mode?';
+      const outcome = await post('/api/v1/mode', {mode}, confirmation, !local);
+      if (outcome.ok && local) {
+        networkState(false, 'Local mode - Wi-Fi off');
+        showMessage('Local mode enabled. This Wi-Fi network will now close.');
+      }
+    }
 
     function switchView(view) {
       currentView = view;
