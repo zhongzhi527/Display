@@ -1,11 +1,16 @@
 #include <Arduino.h>
+#include <PhoneControlPage.h>
+#include <HistoryStore.h>
 #include <DualScaleBleProtocol.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
+#include <WebServer.h>
+#include <WiFi.h>
 #include <driver/gpio.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -43,6 +48,21 @@ constexpr uint8_t BRIGHTNESS_STEP_PERCENT = 10;
 constexpr uint8_t DEFAULT_BRIGHTNESS_PERCENT = 100;
 constexpr uint16_t DEFAULT_CPU_FREQUENCY_MHZ = 240;
 
+// The phone connects directly to this access point. Internet and a router are
+// not required; the touchscreen remains the only BLE master for both scales.
+constexpr char PHONE_WIFI_SSID[] = "WEIGHING_SCALE";
+constexpr char PHONE_WIFI_PASSWORD[] = "ScaleControl";
+constexpr uint8_t PHONE_WIFI_CHANNEL = 6;
+constexpr uint8_t PHONE_WIFI_MAX_CLIENTS = 2;
+constexpr uint32_t PHONE_CLIENT_CHECK_INTERVAL_MS = 1000;
+constexpr uint32_t PHONE_ACTION_MIN_INTERVAL_MS = 250;
+constexpr uint8_t HISTORY_PAGE_DEFAULT_LIMIT = 10;
+constexpr uint8_t HISTORY_PAGE_MAX_LIMIT = 20;
+constexpr uint64_t HISTORY_MIN_TIMESTAMP_MS = 1577836800000ULL;
+constexpr uint64_t HISTORY_MAX_TIMESTAMP_MS = 4102444800000ULL;
+constexpr int16_t HISTORY_MIN_TIMEZONE_OFFSET_MINUTES = -840;
+constexpr int16_t HISTORY_MAX_TIMEZONE_OFFSET_MINUTES = 840;
+
 constexpr char LOCAL_BLUETOOTH_NAME[] = "LOAD_CELL_DISPLAY";
 constexpr char SETTINGS_NAMESPACE[] = "display_ui";
 constexpr char BRIGHTNESS_KEY[] = "brightness";
@@ -73,6 +93,8 @@ constexpr uint32_t SCALE_BORDER_SERVICE_INTERVAL_MS = 50;
 constexpr uint32_t SCALE_BORDER_SEARCH_BLINK_MS = 700;
 constexpr uint32_t SCALE_BORDER_ATTENTION_BLINK_MS = 900;
 constexpr uint32_t SCALE_BORDER_ERROR_BLINK_MS = 800;
+constexpr uint32_t CALIBRATION_REPEAT_DELAY_MS = 500;
+constexpr uint32_t CALIBRATION_REPEAT_INTERVAL_MS = 150;
 
 constexpr uint16_t COLOR_BACKGROUND = 0x0861;
 constexpr uint16_t COLOR_PANEL = 0x10C3;
@@ -99,17 +121,46 @@ static_assert(NIMBLE_MAX_CONNECTIONS >= REMOTE_SCALE_COUNT,
 TFT_eSPI tft;
 TFT_eSprite weightSprite(&tft);
 Preferences settingsPreferences;
+WebServer phoneWebServer(80);
+ScaleHistory::Store historyStore;
 
 struct TouchSample {
   uint16_t x = 0;
   uint16_t y = 0;
 };
 
+struct CalibrationAdjustButtonDefinition {
+  int16_t x;
+  int16_t y;
+  int16_t width;
+  int16_t height;
+  float adjustmentKg;
+  const char *label;
+};
+
+constexpr CalibrationAdjustButtonDefinition CALIBRATION_ADJUST_BUTTONS[] = {
+    {4, 194, 55, 32, -1.0f, "-1"},
+    {63, 194, 55, 32, -0.1f, "-0.1"},
+    {122, 194, 55, 32, 0.1f, "+0.1"},
+    {181, 194, 55, 32, 1.0f, "+1"},
+};
+constexpr uint8_t CALIBRATION_ADJUST_BUTTON_COUNT =
+    sizeof(CALIBRATION_ADJUST_BUTTONS) /
+    sizeof(CALIBRATION_ADJUST_BUTTONS[0]);
+constexpr uint8_t NO_CALIBRATION_ADJUST_BUTTON = UINT8_MAX;
+
 enum class Page {
   Dashboard,
   Calibration,
   Settings,
   Connectivity,
+};
+
+enum class CalibrationRepeatPhase : uint8_t {
+  Idle,
+  Waiting,
+  Repeating,
+  CancelledUntilRelease,
 };
 
 bool touchReady = false;
@@ -119,6 +170,7 @@ bool idleWarningActive = false;
 bool backlightPwmReady = false;
 bool settingsPreferencesReady = false;
 bool bluetoothReady = false;
+bool phoneControlReady = false;
 bool weightValid = false;
 bool pageDirty = true;
 bool uiDirty = true;
@@ -134,6 +186,10 @@ uint16_t dashboardScaleBorderDrawnColor[REMOTE_SCALE_COUNT] = {
     UINT16_MAX,
 };
 uint32_t lastScaleBorderServiceMs = 0;
+CalibrationRepeatPhase calibrationRepeatPhase =
+    CalibrationRepeatPhase::Idle;
+uint8_t activeCalibrationAdjustButton = NO_CALIBRATION_ADJUST_BUTTON;
+uint32_t nextCalibrationRepeatAtMs = 0;
 
 Page currentPage = Page::Dashboard;
 float latestWeightKg = 0.0f;
@@ -147,7 +203,13 @@ uint32_t lastTouchActionMs = 0;
 uint32_t lastUserActivityMs = 0;
 uint32_t noticeUntilMs = 0;
 uint32_t lastConnectivityRedrawMs = 0;
+uint32_t lastPhoneClientCheckMs = 0;
+uint32_t lastPhoneActionMs = 0;
+uint8_t phoneClientCount = 0;
 uint8_t idleWarningSecondsShown = 0;
+uint32_t currentWeightLockToken = 0;
+bool currentWeightLockSaved = false;
+uint32_t currentWeightLockRecordId = 0;
 
 enum class CombinedMode : uint8_t {
   None,
@@ -169,6 +231,12 @@ enum class ScaleBorderMode : uint8_t {
   Error,
   Locked,
   Inactive,
+};
+
+struct ControlActionResult {
+  bool accepted = false;
+  uint16_t httpStatus = 409;
+  String message;
 };
 
 struct WeightSnapshot {
@@ -384,6 +452,23 @@ void drawButton(int16_t x,
                   fill);
 }
 
+void drawCalibrationAdjustButton(uint8_t index, bool pressed) {
+  if (index >= CALIBRATION_ADJUST_BUTTON_COUNT) {
+    return;
+  }
+
+  const CalibrationAdjustButtonDefinition &button =
+      CALIBRATION_ADJUST_BUTTONS[index];
+  drawButton(button.x,
+             button.y,
+             button.width,
+             button.height,
+             button.label,
+             pressed ? COLOR_PRIMARY : COLOR_PANEL_LIGHT,
+             pressed ? COLOR_PRIMARY : COLOR_MUTED,
+             1);
+}
+
 void beginWeightSprite() {
   weightSprite.setColorDepth(16);
   weightSpriteReady =
@@ -408,6 +493,40 @@ bool pointInRect(uint16_t x,
                  int16_t width,
                  int16_t height) {
   return x >= left && x < left + width && y >= top && y < top + height;
+}
+
+int8_t calibrationAdjustButtonAt(const TouchSample &sample) {
+  for (uint8_t index = 0;
+       index < CALIBRATION_ADJUST_BUTTON_COUNT;
+       ++index) {
+    const CalibrationAdjustButtonDefinition &button =
+        CALIBRATION_ADJUST_BUTTONS[index];
+    if (pointInRect(sample.x,
+                    sample.y,
+                    button.x,
+                    button.y,
+                    button.width,
+                    button.height)) {
+      return static_cast<int8_t>(index);
+    }
+  }
+  return -1;
+}
+
+bool touchRemainsOnCalibrationAdjustButton(const TouchSample &sample) {
+  if (activeCalibrationAdjustButton >=
+      CALIBRATION_ADJUST_BUTTON_COUNT) {
+    return false;
+  }
+
+  const CalibrationAdjustButtonDefinition &button =
+      CALIBRATION_ADJUST_BUTTONS[activeCalibrationAdjustButton];
+  return pointInRect(sample.x,
+                     sample.y,
+                     button.x,
+                     button.y,
+                     button.width,
+                     button.height);
 }
 
 uint8_t connectedScaleCount() {
@@ -679,6 +798,12 @@ void unlockCombinedWeight(const char *reason) {
 void lockCombinedWeight(const WeightSnapshot &snapshot) {
   lockedWeightSnapshot = snapshot;
   weightLockPhase = WeightLockPhase::Locked;
+  ++currentWeightLockToken;
+  if (currentWeightLockToken == 0) {
+    currentWeightLockToken = 1;
+  }
+  currentWeightLockSaved = false;
+  currentWeightLockRecordId = 0;
   clearWeightLockSamples();
   markWeightLockSyncPending();
   markWeightLockUiDirty();
@@ -1395,6 +1520,17 @@ void drawDashboard() {
   }
 }
 
+void drawCalibrationWeightValue() {
+  // Update only the number area so auto-repeat does not flash the page.
+  tft.fillRect(10, 108, 220, 43, COLOR_PANEL);
+  char knownWeightText[24];
+  snprintf(knownWeightText,
+           sizeof(knownWeightText),
+           "%.1f kg",
+           calibrationWeightKg);
+  setCenteredText(knownWeightText, 120, 130, 3, TFT_WHITE, COLOR_PANEL);
+}
+
 void drawCalibrationDynamic() {
   tft.fillRoundRect(6, 84, 228, 72, 9, COLOR_PANEL);
   tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
@@ -1402,13 +1538,7 @@ void drawCalibrationDynamic() {
   tft.setCursor(16, 94);
   tft.print("KNOWN WEIGHT - SCALE ");
   tft.print(calibrationTargetIndex + 1);
-
-  char knownWeightText[24];
-  snprintf(knownWeightText,
-           sizeof(knownWeightText),
-           "%.1f kg",
-           calibrationWeightKg);
-  setCenteredText(knownWeightText, 120, 130, 3, TFT_WHITE, COLOR_PANEL);
+  drawCalibrationWeightValue();
 
   drawButton(6,
              158,
@@ -1466,10 +1596,15 @@ void drawCalibrationPage() {
   tft.setCursor(8, 65);
   tft.println("2. Load selected cell only, then CAL");
 
-  drawButton(4, 194, 55, 32, "-1", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
-  drawButton(63, 194, 55, 32, "-0.1", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
-  drawButton(122, 194, 55, 32, "+0.1", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
-  drawButton(181, 194, 55, 32, "+1", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
+  for (uint8_t index = 0;
+       index < CALIBRATION_ADJUST_BUTTON_COUNT;
+       ++index) {
+    const bool pressed =
+        index == activeCalibrationAdjustButton &&
+        (calibrationRepeatPhase == CalibrationRepeatPhase::Waiting ||
+         calibrationRepeatPhase == CalibrationRepeatPhase::Repeating);
+    drawCalibrationAdjustButton(index, pressed);
+  }
 
   drawCalibrationDynamic();
 }
@@ -2264,16 +2399,17 @@ void bleManagerTask(void *) {
     }
 
     bool attemptedConnection = false;
-    if (!screenSleeping) {
-      for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
-        BleTransportSlot &slot = bleTransport[index];
-        if (!slot.connected &&
-            slot.addressKnown &&
-            static_cast<int32_t>(millis() - slot.nextAttemptMs) >= 0) {
-          connectBleScale(index);
-          attemptedConnection = true;
-          break;
-        }
+    // LCD standby is display-only. BLE discovery and reconnect must continue
+    // so weighing, locking, and phone control remain available with the panel
+    // dark.
+    for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+      BleTransportSlot &slot = bleTransport[index];
+      if (!slot.connected &&
+          slot.addressKnown &&
+          static_cast<int32_t>(millis() - slot.nextAttemptMs) >= 0) {
+        connectBleScale(index);
+        attemptedConnection = true;
+        break;
       }
     }
     if (attemptedConnection) {
@@ -2285,17 +2421,11 @@ void bleManagerTask(void *) {
       scanNeeded |= !slot.addressKnown;
     }
 
-    if (screenSleeping) {
-      if (scan->isScanning()) {
-        scan->stop();
-      }
-      // Wake-up starts a fresh discovery window immediately.
-      nextScanAtMs = 0;
-    } else if (scanNeeded &&
-               !scan->isScanning() &&
-               !attemptedConnection &&
-               (nextScanAtMs == 0 ||
-                static_cast<int32_t>(millis() - nextScanAtMs) >= 0)) {
+    if (scanNeeded &&
+        !scan->isScanning() &&
+        !attemptedConnection &&
+        (nextScanAtMs == 0 ||
+         static_cast<int32_t>(millis() - nextScanAtMs) >= 0)) {
       if (scan->start(BLE_SCAN_WINDOW_MS, false, true)) {
         nextScanAtMs =
             millis() + BLE_SCAN_WINDOW_MS + BLE_SCAN_PAUSE_MS;
@@ -2330,10 +2460,10 @@ bool startBleManager() {
   return true;
 }
 
-void requestBleReconnect(uint8_t scaleIndex) {
+bool requestBleReconnect(uint8_t scaleIndex) {
   if (scaleIndex >= REMOTE_SCALE_COUNT ||
       scaleStates[scaleIndex].reconnectRequested) {
-    return;
+    return false;
   }
 
   BleManagerMessage message;
@@ -2341,7 +2471,9 @@ void requestBleReconnect(uint8_t scaleIndex) {
   message.scaleIndex = scaleIndex;
   if (queueBleManagerMessage(message)) {
     scaleStates[scaleIndex].reconnectRequested = true;
+    return true;
   }
+  return false;
 }
 
 bool queueScaleCommand(uint8_t scaleIndex,
@@ -2739,10 +2871,288 @@ void processBleUiEvents() {
   recomputeCombinedWeight();
 }
 
+bool scaleReadyForTareCommand(uint8_t scaleIndex) {
+  if (scaleIndex >= REMOTE_SCALE_COUNT) {
+    return false;
+  }
+  constexpr uint8_t HEALTH_FLAGS =
+      DualScaleBle::TelemetryFlag::SensorPresent |
+      DualScaleBle::TelemetryFlag::AdcResponding;
+  const ScaleState &state = scaleStates[scaleIndex];
+  return state.connected && state.identityVerified &&
+         state.lastTelemetryMs != 0 &&
+         millis() - state.lastTelemetryMs <= TELEMETRY_STALE_MS &&
+         (state.flags & HEALTH_FLAGS) == HEALTH_FLAGS &&
+         state.pendingToken == 0 &&
+         state.status != DualScaleBle::Status::Taring &&
+         state.status != DualScaleBle::Status::Calibrating &&
+         state.status != DualScaleBle::Status::ShuttingDown;
+}
+
+bool scaleSensorHealthyForCalibration(uint8_t scaleIndex) {
+  if (scaleIndex >= REMOTE_SCALE_COUNT) {
+    return false;
+  }
+  constexpr uint8_t HEALTH_FLAGS =
+      DualScaleBle::TelemetryFlag::SensorPresent |
+      DualScaleBle::TelemetryFlag::AdcResponding;
+  const ScaleState &state = scaleStates[scaleIndex];
+  return state.connected && state.identityVerified &&
+         state.lastTelemetryMs != 0 &&
+         millis() - state.lastTelemetryMs <= TELEMETRY_STALE_MS &&
+         (state.flags & HEALTH_FLAGS) == HEALTH_FLAGS &&
+         state.status != DualScaleBle::Status::NoSensor &&
+         state.status != DualScaleBle::Status::SensorError &&
+         state.status != DualScaleBle::Status::ShuttingDown;
+}
+
+ControlActionResult requestControllerTare(uint8_t targetMask,
+                                          const char *source) {
+  ControlActionResult result;
+  if ((targetMask & 0x03U) == 0 || (targetMask & ~0x03U) != 0) {
+    result.httpStatus = 400;
+    result.message = "Invalid tare target";
+    return result;
+  }
+
+  uint8_t requestedCount = 0;
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    if ((targetMask & (1U << index)) == 0) {
+      continue;
+    }
+    ++requestedCount;
+  }
+
+  // Preflight every selected scale before queueing any command. In
+  // particular, TARE BOTH must be all-or-nothing so the two zero offsets
+  // cannot silently become mismatched.
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    if ((targetMask & (1U << index)) == 0 ||
+        scaleReadyForTareCommand(index)) {
+      continue;
+    }
+    result.httpStatus = 409;
+    result.message = scaleStates[index].connected
+                         ? "Load Cell " + String(index == 0 ? "A" : "B") +
+                               " is busy or not ready"
+                         : "Load Cell " + String(index == 0 ? "A" : "B") +
+                               " is not connected";
+    showNotice(result.message, 3500);
+    return result;
+  }
+
+  if (bleManagerQueue == nullptr ||
+      uxQueueSpacesAvailable(bleManagerQueue) < requestedCount) {
+    result.httpStatus = 503;
+    result.message = "BLE command queue is busy; try again";
+    showNotice(result.message, 3000);
+    return result;
+  }
+
+  bool queued[REMOTE_SCALE_COUNT] = {};
+  uint8_t queuedCount = 0;
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    if ((targetMask & (1U << index)) == 0) {
+      continue;
+    }
+    queued[index] =
+        queueScaleCommand(index, DualScaleBle::CommandType::Tare);
+    queuedCount += static_cast<uint8_t>(queued[index]);
+  }
+
+  if (queuedCount != requestedCount) {
+    result.httpStatus = 503;
+    result.message = "Could not queue every tare command; try again";
+    showNotice(result.message, 3500);
+    return result;
+  }
+
+  // Unlock only after at least one tare command is safely in the BLE queue.
+  unlockCombinedWeight(source);
+  result.accepted = true;
+  result.httpStatus = 202;
+  if (queued[0] && queued[1]) {
+    result.message = "Taring both scales...";
+  } else if (queued[0]) {
+    result.message = "Taring Load Cell A...";
+  } else {
+    result.message = "Taring Load Cell B...";
+  }
+  showNotice(result.message, 3000);
+  Serial.printf("Controller tare accepted from %s (mask=0x%02X).\n",
+                source ? source : "unknown",
+                targetMask);
+  return result;
+}
+
+ControlActionResult requestControllerCalibration(uint8_t scaleIndex,
+                                                 int32_t valueGrams,
+                                                 const char *source) {
+  ControlActionResult result;
+  if (scaleIndex >= REMOTE_SCALE_COUNT ||
+      valueGrams < 100 || valueGrams > 100000) {
+    result.httpStatus = 400;
+    result.message = "Calibration weight must be 0.1 to 100 kg";
+    return result;
+  }
+
+  ScaleState &state = scaleStates[scaleIndex];
+  if (!state.connected || !state.identityVerified) {
+    result.message = "Selected scale is not connected";
+    showNotice(result.message, 3500);
+    return result;
+  }
+  if (scaleOperationCommandPending() || state.pendingToken != 0 ||
+      state.status == DualScaleBle::Status::Taring ||
+      state.status == DualScaleBle::Status::Calibrating) {
+    result.message = "A scale operation is already running";
+    showNotice(result.message, 3500);
+    return result;
+  }
+  if (!scaleSensorHealthyForCalibration(scaleIndex)) {
+    result.message = "Selected load-cell ADC is not ready";
+    showNotice(result.message, 3500);
+    return result;
+  }
+  if ((state.flags & DualScaleBle::TelemetryFlag::Tared) == 0) {
+    result.message = "Tare the selected empty scale first";
+    showNotice(result.message, 4000);
+    return result;
+  }
+  if (!queueScaleCommand(scaleIndex,
+                         DualScaleBle::CommandType::Calibrate,
+                         valueGrams)) {
+    result.message = "Could not queue calibration command";
+    showNotice(result.message, 3500);
+    return result;
+  }
+
+  // Unlock only after calibration has been accepted by the manager queue.
+  unlockCombinedWeight(source);
+  result.accepted = true;
+  result.httpStatus = 202;
+  result.message = "Calibrating Load Cell " +
+                   String(scaleIndex == 0 ? "A" : "B") + " with " +
+                   String(valueGrams / 1000.0f, 3) + " kg...";
+  showNotice(result.message, 4500);
+  Serial.printf("Controller calibration accepted from %s for Scale %u.\n",
+                source ? source : "unknown",
+                scaleIndex + 1);
+  return result;
+}
+
+ControlActionResult requestControllerUnlock(const char *source) {
+  ControlActionResult result;
+  const bool wasLocked = weightLockPhase == WeightLockPhase::Locked;
+  const bool wasSettling = weightLockPhase == WeightLockPhase::Settling;
+  unlockCombinedWeight(source);
+  result.accepted = true;
+  result.httpStatus = 200;
+  result.message = wasLocked
+                       ? "Weight unlocked; automatic locking re-armed"
+                       : wasSettling
+                             ? "Lock timer cancelled and re-armed"
+                             : "Automatic weight lock re-armed";
+  showNotice(result.message, 2200);
+  return result;
+}
+
 void adjustCalibrationWeight(float amount) {
-  calibrationWeightKg = constrain(calibrationWeightKg + amount, 0.1f, 100.0f);
-  calibrationWeightKg = roundf(calibrationWeightKg * 10.0f) / 10.0f;
-  uiDirty = true;
+  const float adjustedWeightKg =
+      roundf(constrain(calibrationWeightKg + amount, 0.1f, 100.0f) *
+             10.0f) /
+      10.0f;
+  if (fabsf(adjustedWeightKg - calibrationWeightKg) < 0.001f) {
+    return;
+  }
+
+  calibrationWeightKg = adjustedWeightKg;
+  if (currentPage == Page::Calibration && !screenSleeping &&
+      !idleWarningActive && !pageDirty) {
+    drawCalibrationWeightValue();
+  } else {
+    uiDirty = true;
+  }
+}
+
+void finishCalibrationWeightRepeat(bool redrawButton) {
+  if (redrawButton &&
+      activeCalibrationAdjustButton <
+          CALIBRATION_ADJUST_BUTTON_COUNT &&
+      currentPage == Page::Calibration && !screenSleeping &&
+      !idleWarningActive && !pageDirty) {
+    drawCalibrationAdjustButton(activeCalibrationAdjustButton, false);
+  }
+
+  activeCalibrationAdjustButton = NO_CALIBRATION_ADJUST_BUTTON;
+  calibrationRepeatPhase = CalibrationRepeatPhase::Idle;
+  nextCalibrationRepeatAtMs = 0;
+}
+
+void cancelCalibrationWeightRepeatUntilRelease(bool redrawButton) {
+  if (redrawButton &&
+      activeCalibrationAdjustButton <
+          CALIBRATION_ADJUST_BUTTON_COUNT &&
+      currentPage == Page::Calibration && !screenSleeping &&
+      !idleWarningActive && !pageDirty) {
+    drawCalibrationAdjustButton(activeCalibrationAdjustButton, false);
+  }
+
+  activeCalibrationAdjustButton = NO_CALIBRATION_ADJUST_BUTTON;
+  calibrationRepeatPhase =
+      CalibrationRepeatPhase::CancelledUntilRelease;
+  nextCalibrationRepeatAtMs = 0;
+}
+
+void beginCalibrationWeightRepeat(uint8_t buttonIndex) {
+  if (buttonIndex >= CALIBRATION_ADJUST_BUTTON_COUNT ||
+      calibrationRepeatPhase != CalibrationRepeatPhase::Idle) {
+    return;
+  }
+
+  activeCalibrationAdjustButton = buttonIndex;
+  calibrationRepeatPhase = CalibrationRepeatPhase::Waiting;
+  nextCalibrationRepeatAtMs =
+      millis() + CALIBRATION_REPEAT_DELAY_MS;
+
+  adjustCalibrationWeight(
+      CALIBRATION_ADJUST_BUTTONS[buttonIndex].adjustmentKg);
+  if (!screenSleeping && !idleWarningActive && !pageDirty) {
+    drawCalibrationAdjustButton(buttonIndex, true);
+  }
+}
+
+void serviceCalibrationWeightRepeat(const TouchSample *sample) {
+  if (sample == nullptr) {
+    finishCalibrationWeightRepeat(true);
+    return;
+  }
+
+  if (calibrationRepeatPhase == CalibrationRepeatPhase::Idle ||
+      calibrationRepeatPhase ==
+          CalibrationRepeatPhase::CancelledUntilRelease) {
+    return;
+  }
+
+  if (currentPage != Page::Calibration || screenSleeping ||
+      idleWarningActive ||
+      !touchRemainsOnCalibrationAdjustButton(*sample)) {
+    cancelCalibrationWeightRepeatUntilRelease(true);
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - nextCalibrationRepeatAtMs) < 0) {
+    return;
+  }
+
+  adjustCalibrationWeight(
+      CALIBRATION_ADJUST_BUTTONS[activeCalibrationAdjustButton]
+          .adjustmentKg);
+  calibrationRepeatPhase = CalibrationRepeatPhase::Repeating;
+  // Schedule from now rather than catching up after a slow display update.
+  nextCalibrationRepeatAtMs =
+      now + CALIBRATION_REPEAT_INTERVAL_MS;
 }
 
 void handleDashboardTouch(const TouchSample &sample) {
@@ -2759,30 +3169,11 @@ void handleDashboardTouch(const TouchSample &sample) {
 
   if (pointInRect(sample.x, sample.y, 6, 256, 108, 56)) {
     if (weightLockPhase == WeightLockPhase::Locked) {
-      unlockCombinedWeight("touchscreen UNLOCK button");
-      showNotice("Weight unlocked - re-arming", 1800);
+      requestControllerUnlock("touchscreen UNLOCK button");
       return;
     }
 
-    unlockCombinedWeight("TARE ALL");
-    bool queued[REMOTE_SCALE_COUNT] = {};
-    for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
-      queued[index] =
-          queueScaleCommand(index, DualScaleBle::CommandType::Tare);
-    }
-    const uint8_t count =
-        static_cast<uint8_t>(queued[0]) +
-        static_cast<uint8_t>(queued[1]);
-    if (count == 2) {
-      showNotice("Taring both scales...");
-    } else if (count == 1) {
-      showNotice(queued[0] ? "Taring Scale 1..."
-                           : "Taring Scale 2...");
-    } else {
-      showNotice(connectedScaleCount() == 0
-                     ? "No scale connected"
-                     : "Scale command already running");
-    }
+    requestControllerTare(0x03, "touchscreen TARE ALL");
     return;
   }
 
@@ -2809,54 +3200,31 @@ void handleCalibrationTouch(const TouchSample &sample) {
     return;
   }
 
-  if (pointInRect(sample.x, sample.y, 4, 194, 55, 32)) {
-    adjustCalibrationWeight(-1.0f);
-    return;
-  }
-  if (pointInRect(sample.x, sample.y, 63, 194, 55, 32)) {
-    adjustCalibrationWeight(-0.1f);
-    return;
-  }
-  if (pointInRect(sample.x, sample.y, 122, 194, 55, 32)) {
-    adjustCalibrationWeight(0.1f);
-    return;
-  }
-  if (pointInRect(sample.x, sample.y, 181, 194, 55, 32)) {
-    adjustCalibrationWeight(1.0f);
+  const int8_t adjustButtonIndex =
+      calibrationAdjustButtonAt(sample);
+  if (adjustButtonIndex >= 0) {
+    beginCalibrationWeightRepeat(
+        static_cast<uint8_t>(adjustButtonIndex));
     return;
   }
 
   if (pointInRect(sample.x, sample.y, 6, 232, 228, 36)) {
-    unlockCombinedWeight("tare command");
-    if (queueScaleCommand(calibrationTargetIndex,
-                          DualScaleBle::CommandType::Tare)) {
-      showNotice("Taring Scale " +
-                 String(calibrationTargetIndex + 1) + "...");
-    } else {
-      showNotice(scaleStates[calibrationTargetIndex].connected
-                     ? "Selected scale is busy"
-                     : "Selected scale not connected");
-    }
+    requestControllerTare(
+        static_cast<uint8_t>(1U << calibrationTargetIndex),
+        "touchscreen tare command");
     return;
   }
 
   if (pointInRect(sample.x, sample.y, 6, 276, 228, 37)) {
-    unlockCombinedWeight("calibration command");
     const int32_t valueGrams =
         static_cast<int32_t>(lroundf(calibrationWeightKg * 1000.0f));
-    if (!queueScaleCommand(calibrationTargetIndex,
-                           DualScaleBle::CommandType::Calibrate,
-                           valueGrams)) {
-      showNotice(scaleStates[calibrationTargetIndex].connected
-                     ? "Selected scale is busy"
-                     : "Selected scale not connected");
-      return;
+    const ControlActionResult result =
+        requestControllerCalibration(calibrationTargetIndex,
+                                     valueGrams,
+                                     "touchscreen calibration command");
+    if (result.accepted) {
+      changePage(Page::Dashboard);
     }
-
-    changePage(Page::Dashboard);
-    showNotice("Calibrating Scale " +
-                   String(calibrationTargetIndex + 1) + "...",
-               4500);
   }
 }
 
@@ -2915,6 +3283,1318 @@ void processTouch(const TouchSample &sample, bool newTouch) {
   }
 }
 
+const char *phoneLockLabel() {
+  if (weightLockPhase == WeightLockPhase::Locked) {
+    return "LOCKED";
+  }
+  if (weightLockPhase == WeightLockPhase::Settling) {
+    return "LOCKING";
+  }
+  return "LIVE";
+}
+
+const char *phonePendingCommandLabel(DualScaleBle::CommandType command) {
+  switch (command) {
+  case DualScaleBle::CommandType::Tare:
+    return "TARE";
+  case DualScaleBle::CommandType::Calibrate:
+    return "CALIBRATE";
+  case DualScaleBle::CommandType::PeerStatus:
+    return "PEER SYNC";
+  case DualScaleBle::CommandType::SetWeightLock:
+    return "LOCK SYNC";
+  case DualScaleBle::CommandType::ClearWeightLock:
+    return "UNLOCK SYNC";
+  case DualScaleBle::CommandType::Status:
+  default:
+    return "STATUS";
+  }
+}
+
+String phonePendingLabel(uint8_t scaleIndex) {
+  const ScaleState &state = scaleStates[scaleIndex];
+  if (state.pendingToken != 0) {
+    return String(phonePendingCommandLabel(state.pendingCommand)) + " #" +
+           String(state.pendingToken);
+  }
+  if (state.status == DualScaleBle::Status::Taring) {
+    return "TARING";
+  }
+  if (state.status == DualScaleBle::Status::Calibrating) {
+    return "CALIBRATING";
+  }
+  return "IDLE";
+}
+
+void appendJsonString(String &json, const String &value) {
+  json += '"';
+  for (size_t index = 0; index < value.length(); ++index) {
+    const char character = value.charAt(index);
+    switch (character) {
+    case '"':
+      json += "\\\"";
+      break;
+    case '\\':
+      json += "\\\\";
+      break;
+    case '\n':
+      json += "\\n";
+      break;
+    case '\r':
+      json += "\\r";
+      break;
+    case '\t':
+      json += "\\t";
+      break;
+    default:
+      json += (static_cast<uint8_t>(character) < 0x20 ? ' ' : character);
+      break;
+    }
+  }
+  json += '"';
+}
+
+void appendJsonBool(String &json, bool value) {
+  json += value ? "true" : "false";
+}
+
+void appendJsonUint64(String &json, uint64_t value) {
+  char buffer[24];
+  snprintf(buffer,
+           sizeof(buffer),
+           "%llu",
+           static_cast<unsigned long long>(value));
+  json += buffer;
+}
+
+void sendPhoneJson(int statusCode, const String &json) {
+  phoneWebServer.sendHeader("Cache-Control", "no-store, max-age=0");
+  phoneWebServer.sendHeader("X-Content-Type-Options", "nosniff");
+  phoneWebServer.send(statusCode, "application/json", json);
+}
+
+void sendPhoneMessage(int statusCode,
+                      bool accepted,
+                      const String &message) {
+  String json;
+  json.reserve(message.length() + 48);
+  json = "{\"ok\":";
+  appendJsonBool(json, accepted);
+  json += ",\"message\":";
+  appendJsonString(json, message);
+  json += '}';
+  sendPhoneJson(statusCode, json);
+}
+
+bool validatePhonePost() {
+  if (phoneWebServer.header("X-Scale-Control") != "1") {
+    sendPhoneMessage(403, false, "Control request was not authorized");
+    return false;
+  }
+
+  const uint32_t now = millis();
+  if (lastPhoneActionMs != 0 &&
+      now - lastPhoneActionMs < PHONE_ACTION_MIN_INTERVAL_MS) {
+    sendPhoneMessage(429, false, "Please wait before sending another command");
+    return false;
+  }
+  lastPhoneActionMs = now;
+  return true;
+}
+
+bool parsePhoneTarget(const String &argument,
+                      uint8_t &targetMask,
+                      bool allowBoth) {
+  String target = argument;
+  target.trim();
+  target.toLowerCase();
+  if (target == "a" || target == "1") {
+    targetMask = 0x01;
+    return true;
+  }
+  if (target == "b" || target == "2") {
+    targetMask = 0x02;
+    return true;
+  }
+  if (allowBoth && (target == "all" || target == "both")) {
+    targetMask = 0x03;
+    return true;
+  }
+  return false;
+}
+
+bool parsePhoneLong(const String &argument, long &value) {
+  String text = argument;
+  text.trim();
+  if (text.isEmpty() || text.length() > 12) {
+    return false;
+  }
+  char *end = nullptr;
+  value = strtol(text.c_str(), &end, 10);
+  return end != text.c_str() && end != nullptr && *end == '\0';
+}
+
+bool parsePhoneUint64(const String &argument, uint64_t &value) {
+  String text = argument;
+  text.trim();
+  if (text.isEmpty() || text.length() > 20) {
+    return false;
+  }
+
+  uint64_t parsed = 0;
+  for (size_t index = 0; index < text.length(); ++index) {
+    const char character = text.charAt(index);
+    if (character < '0' || character > '9') {
+      return false;
+    }
+    const uint8_t digit = static_cast<uint8_t>(character - '0');
+    if (parsed > (UINT64_MAX - digit) / 10ULL) {
+      return false;
+    }
+    parsed = parsed * 10ULL + digit;
+  }
+  value = parsed;
+  return true;
+}
+
+bool parsePhoneUint32(const String &argument, uint32_t &value) {
+  uint64_t parsed = 0;
+  if (!parsePhoneUint64(argument, parsed) || parsed == 0 ||
+      parsed > UINT32_MAX) {
+    return false;
+  }
+  value = static_cast<uint32_t>(parsed);
+  return true;
+}
+
+bool validUtf8Text(const String &value,
+                   size_t maximumBytes,
+                   bool allowEmpty,
+                   bool allowLineBreaks) {
+  const size_t length = value.length();
+  if ((!allowEmpty && length == 0) || length > maximumBytes) {
+    return false;
+  }
+
+  const uint8_t *bytes =
+      reinterpret_cast<const uint8_t *>(value.c_str());
+  for (size_t index = 0; index < length;) {
+    const uint8_t first = bytes[index];
+    if (first < 0x80) {
+      if (first == 0 ||
+          (first < 0x20 &&
+           !(allowLineBreaks && (first == '\n' || first == '\t')))) {
+        return false;
+      }
+      ++index;
+      continue;
+    }
+
+    size_t continuationCount = 0;
+    if (first >= 0xC2 && first <= 0xDF) {
+      continuationCount = 1;
+    } else if (first >= 0xE0 && first <= 0xEF) {
+      continuationCount = 2;
+    } else if (first >= 0xF0 && first <= 0xF4) {
+      continuationCount = 3;
+    } else {
+      return false;
+    }
+    if (index + continuationCount >= length) {
+      return false;
+    }
+    for (size_t offset = 1; offset <= continuationCount; ++offset) {
+      if ((bytes[index + offset] & 0xC0U) != 0x80U) {
+        return false;
+      }
+    }
+    if ((first == 0xE0 && bytes[index + 1] < 0xA0) ||
+        (first == 0xED && bytes[index + 1] >= 0xA0) ||
+        (first == 0xF0 && bytes[index + 1] < 0x90) ||
+        (first == 0xF4 && bytes[index + 1] >= 0x90)) {
+      return false;
+    }
+    index += continuationCount + 1;
+  }
+  return true;
+}
+
+String historyDisplayId(uint32_t id) {
+  char buffer[20];
+  snprintf(buffer,
+           sizeof(buffer),
+           "LOG-%06lu",
+           static_cast<unsigned long>(id));
+  return String(buffer);
+}
+
+const char *historyModeLabel(uint8_t mode) {
+  switch (static_cast<CombinedMode>(mode)) {
+  case CombinedMode::Dual:
+    return "A + B combined";
+  case CombinedMode::Scale1Only:
+    return "Load Cell A only";
+  case CombinedMode::Scale2Only:
+    return "Load Cell B only";
+  case CombinedMode::None:
+  default:
+    return "No valid scale";
+  }
+}
+
+const char *historyScaleStatusLabel(uint8_t status) {
+  switch (static_cast<DualScaleBle::Status>(status)) {
+  case DualScaleBle::Status::Ready:
+    return "Ready";
+  case DualScaleBle::Status::NeedsCalibration:
+    return "Needs calibration";
+  case DualScaleBle::Status::NeedsTare:
+    return "Needs tare";
+  case DualScaleBle::Status::Taring:
+    return "Taring";
+  case DualScaleBle::Status::Calibrating:
+    return "Calibrating";
+  case DualScaleBle::Status::NoSensor:
+    return "No sensor";
+  case DualScaleBle::Status::SensorError:
+    return "Sensor error";
+  case DualScaleBle::Status::ShuttingDown:
+    return "Shutting down";
+  case DualScaleBle::Status::Starting:
+  default:
+    return "Starting";
+  }
+}
+
+void appendHistoryScaleJson(String &json,
+                            const ScaleHistory::Record &record,
+                            uint8_t index) {
+  const uint8_t bit = 1U << index;
+  const uint8_t flags = record.scaleFlags[index];
+  json += "{\"included\":";
+  appendJsonBool(json, (record.includedMask & bit) != 0);
+  json += ",\"connected\":";
+  appendJsonBool(json, (record.connectionMask & bit) != 0);
+  json += ",\"grams\":";
+  if ((record.includedMask & bit) != 0) {
+    json += record.scaleGrams[index];
+  } else {
+    json += "null";
+  }
+  json += ",\"status\":";
+  appendJsonString(json, historyScaleStatusLabel(record.scaleStatus[index]));
+  json += ",\"sensor\":";
+  appendJsonBool(json,
+                 (flags & DualScaleBle::TelemetryFlag::SensorPresent) != 0);
+  json += ",\"adc\":";
+  appendJsonBool(json,
+                 (flags & DualScaleBle::TelemetryFlag::AdcResponding) != 0);
+  json += ",\"oled\":";
+  appendJsonBool(json,
+                 (flags & DualScaleBle::TelemetryFlag::OledPresent) != 0);
+  json += ",\"tared\":";
+  appendJsonBool(json,
+                 (flags & DualScaleBle::TelemetryFlag::Tared) != 0);
+  json += ",\"calibrated\":";
+  appendJsonBool(json,
+                 (flags & DualScaleBle::TelemetryFlag::Calibrated) != 0);
+  json += '}';
+}
+
+void appendHistoryRecordJson(String &json,
+                             const ScaleHistory::Record &record,
+                             bool includeDetails) {
+  json += "{\"id\":";
+  json += static_cast<unsigned long>(record.id);
+  json += ",\"displayId\":";
+  appendJsonString(json, historyDisplayId(record.id));
+  json += ",\"revision\":";
+  json += static_cast<unsigned int>(record.revision);
+  json += ",\"name\":";
+  appendJsonString(json, String(record.name));
+  json += ",\"loggedAtMs\":";
+  appendJsonUint64(json, record.loggedAtMs);
+  json += ",\"updatedAtMs\":";
+  appendJsonUint64(json, record.updatedAtMs);
+  json += ",\"timezoneOffsetMinutes\":";
+  json += record.timezoneOffsetMinutes;
+  json += ",\"timezone\":";
+  appendJsonString(json, String(record.timezone));
+  json += ",\"totalGrams\":";
+  json += record.totalGrams;
+  json += ",\"mode\":";
+  appendJsonString(json, historyModeLabel(record.combinedMode));
+  json += ",\"includedMask\":";
+  json += static_cast<unsigned int>(record.includedMask);
+  if (includeDetails) {
+    json += ",\"notes\":";
+    appendJsonString(json, String(record.notes));
+    json += ",\"timeSource\":\"iPhone browser\",\"scales\":[";
+    appendHistoryScaleJson(json, record, 0);
+    json += ',';
+    appendHistoryScaleJson(json, record, 1);
+    json += ']';
+  }
+  json += '}';
+}
+
+bool parsePhoneCalibrationGrams(const String &argument,
+                                int32_t &valueGrams) {
+  String text = argument;
+  text.trim();
+  if (text.isEmpty() || text.length() > 16) {
+    return false;
+  }
+  char *end = nullptr;
+  const double valueKg = strtod(text.c_str(), &end);
+  if (end == text.c_str() || end == nullptr || *end != '\0' ||
+      !isfinite(valueKg) || valueKg < 0.1 || valueKg > 100.0) {
+    return false;
+  }
+  valueGrams = static_cast<int32_t>(lround(valueKg * 1000.0));
+  return valueGrams >= 100 && valueGrams <= 100000;
+}
+
+void handlePhoneRoot() {
+  phoneWebServer.sendHeader("Cache-Control", "no-store, max-age=0");
+  phoneWebServer.sendHeader("X-Content-Type-Options", "nosniff");
+  phoneWebServer.sendHeader(
+      "Content-Security-Policy",
+      "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+      "script-src 'self' 'unsafe-inline'; connect-src 'self'");
+  phoneWebServer.send_P(200, "text/html", PHONE_CONTROL_PAGE_HTML);
+}
+
+void handlePhoneStatus() {
+  static String json;
+  // reserve() is a no-op after the retained String buffer reaches this size.
+  json.reserve(3200);
+  json = "{";
+  json += "\"version\":1,\"uptimeMs\":";
+  json += static_cast<unsigned long>(millis());
+  json += ",\"freeHeap\":";
+  json += static_cast<unsigned long>(ESP.getFreeHeap());
+  json += ",\"wifi\":{\"ssid\":";
+  appendJsonString(json, PHONE_WIFI_SSID);
+  json += ",\"ip\":";
+  appendJsonString(json, WiFi.softAPIP().toString());
+  json += ",\"clients\":";
+  json += static_cast<unsigned int>(phoneClientCount);
+  json += "},\"bleReady\":";
+  appendJsonBool(json, bluetoothReady);
+  json += ",\"lock\":";
+  appendJsonString(json, phoneLockLabel());
+
+  const CombinedMode displayedMode =
+      weightLockPhase == WeightLockPhase::Locked
+          ? lockedWeightSnapshot.mode
+          : combinedMode;
+  String modeLabel;
+  switch (displayedMode) {
+  case CombinedMode::Dual:
+    modeLabel = "A + B combined";
+    break;
+  case CombinedMode::Scale1Only:
+    modeLabel = "Partial reading: Load Cell A only";
+    break;
+  case CombinedMode::Scale2Only:
+    modeLabel = "Partial reading: Load Cell B only";
+    break;
+  case CombinedMode::None:
+  default:
+    modeLabel = "Waiting for valid scale data";
+    break;
+  }
+  json += ",\"modeLabel\":";
+  appendJsonString(json, modeLabel);
+
+  const bool totalValid =
+      weightLockPhase == WeightLockPhase::Locked
+          ? lockedWeightSnapshot.mode != CombinedMode::None
+          : weightValid;
+  const int32_t displayedTotalGrams =
+      weightLockPhase == WeightLockPhase::Locked
+          ? lockedWeightSnapshot.totalGrams
+          : latestCombinedGrams;
+  json += ",\"totalGrams\":";
+  if (totalValid) {
+    json += displayedTotalGrams;
+  } else {
+    json += "null";
+  }
+  json += ",\"totalValid\":";
+  appendJsonBool(json, totalValid);
+
+  const bool canTareBoth = scaleReadyForTareCommand(0) &&
+                           scaleReadyForTareCommand(1);
+  json += ",\"canTareBoth\":";
+  appendJsonBool(json, canTareBoth);
+  json += ",\"operationBusy\":";
+  appendJsonBool(json, scaleOperationCommandPending());
+  json += ",\"notice\":";
+  appendJsonString(json, noticeActive() ? noticeMessage : String());
+
+  const bool canSaveCurrentLock =
+      historyStore.ready() &&
+      weightLockPhase == WeightLockPhase::Locked &&
+      lockedWeightSnapshot.mode != CombinedMode::None &&
+      !currentWeightLockSaved;
+  json += ",\"history\":{\"ready\":";
+  appendJsonBool(json, historyStore.ready());
+  json += ",\"count\":";
+  json += static_cast<unsigned int>(historyStore.count());
+  json += ",\"capacity\":";
+  json += static_cast<unsigned int>(historyStore.capacity());
+  json += ",\"canSaveCurrentLock\":";
+  appendJsonBool(json, canSaveCurrentLock);
+  json += ",\"currentLockSaved\":";
+  appendJsonBool(json, currentWeightLockSaved);
+  json += ",\"lockToken\":";
+  json += static_cast<unsigned long>(currentWeightLockToken);
+  json += '}';
+
+  json += ",\"display\":{\"brightness\":";
+  json += static_cast<unsigned int>(brightnessPercent);
+  json += ",\"cpuMHz\":";
+  json += cpuFrequencyMhz;
+  json += ",\"sleeping\":";
+  appendJsonBool(json, screenSleeping);
+  json += "},\"scales\":[";
+
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    if (index != 0) {
+      json += ',';
+    }
+    const ScaleState &state = scaleStates[index];
+    const bool locked = weightLockPhase == WeightLockPhase::Locked;
+    const bool lockedContributor =
+        locked && lockedWeightSnapshot.scaleIncluded[index];
+    const bool displayedWeightValid =
+        locked ? lockedContributor : scaleUsable(index);
+    const int32_t displayedScaleGrams =
+        lockedContributor ? lockedWeightSnapshot.scaleGrams[index]
+                          : state.weightGrams;
+    const bool busy = state.pendingToken != 0 ||
+                      state.status == DualScaleBle::Status::Taring ||
+                      state.status == DualScaleBle::Status::Calibrating;
+    const bool canCalibrate =
+        !scaleOperationCommandPending() && !busy &&
+        scaleSensorHealthyForCalibration(index) &&
+        (state.flags & DualScaleBle::TelemetryFlag::Tared) != 0;
+
+    json += "{\"unit\":";
+    json += index + 1;
+    json += ",\"connected\":";
+    appendJsonBool(json, state.connected && state.identityVerified);
+    json += ",\"usable\":";
+    appendJsonBool(json, scaleUsable(index));
+    json += ",\"busy\":";
+    appendJsonBool(json, busy);
+    json += ",\"canTare\":";
+    appendJsonBool(json, scaleReadyForTareCommand(index));
+    json += ",\"canCalibrate\":";
+    appendJsonBool(json, canCalibrate);
+    json += ",\"weightGrams\":";
+    if (displayedWeightValid) {
+      json += displayedScaleGrams;
+    } else {
+      json += "null";
+    }
+    json += ",\"weightValid\":";
+    appendJsonBool(json, displayedWeightValid);
+    json += ",\"system\":";
+    appendJsonString(json, dashboardScaleStatus(index));
+    json += ",\"link\":";
+    appendJsonString(json, scaleLinkLabel(index));
+    json += ",\"adc\":";
+    appendJsonString(json, scaleAdcLabel(index));
+    json += ",\"oled\":";
+    appendJsonString(json, scaleOledLabel(index));
+    json += ",\"data\":";
+    appendJsonString(json, scaleDataLabel(index));
+    json += ",\"age\":";
+    appendJsonString(json, scaleAgeLabel(index));
+    json += ",\"pending\":";
+    appendJsonString(json, phonePendingLabel(index));
+    json += '}';
+  }
+  json += "]}";
+  sendPhoneJson(200, json);
+}
+
+bool readHistoryTextFields(String &name, String &notes) {
+  if (!phoneWebServer.hasArg("name") ||
+      !phoneWebServer.hasArg("notes")) {
+    sendPhoneMessage(400, false, "Name and notes fields are required");
+    return false;
+  }
+  name = phoneWebServer.arg("name");
+  notes = phoneWebServer.arg("notes");
+  name.trim();
+  notes.replace("\r\n", "\n");
+  notes.replace("\r", "\n");
+  notes.trim();
+  if (!validUtf8Text(name,
+                     ScaleHistory::NAME_CAPACITY - 1,
+                     false,
+                     false)) {
+    sendPhoneMessage(400,
+                     false,
+                     "Name must be 1 to 50 valid text bytes");
+    return false;
+  }
+  if (!validUtf8Text(notes,
+                     ScaleHistory::NOTES_CAPACITY - 1,
+                     true,
+                     true)) {
+    sendPhoneMessage(400,
+                     false,
+                     "Notes must be no more than 500 valid text bytes");
+    return false;
+  }
+  return true;
+}
+
+bool readHistoryTimestamp(uint64_t &timestampMs) {
+  if (!phoneWebServer.hasArg("timestampMs") ||
+      !parsePhoneUint64(phoneWebServer.arg("timestampMs"), timestampMs) ||
+      timestampMs < HISTORY_MIN_TIMESTAMP_MS ||
+      timestampMs > HISTORY_MAX_TIMESTAMP_MS) {
+    sendPhoneMessage(400,
+                     false,
+                     "Phone date/time must be between 2020 and 2100");
+    return false;
+  }
+  return true;
+}
+
+void sendHistoryStoreFailure(ScaleHistory::Result result) {
+  if (result == ScaleHistory::Result::NotFound) {
+    sendPhoneMessage(404, false, "History entry was not found");
+  } else if (result == ScaleHistory::Result::Conflict) {
+    sendPhoneMessage(409,
+                     false,
+                     "This entry changed on another phone; reopen Details");
+  } else if (result == ScaleHistory::Result::NotReady) {
+    sendPhoneMessage(503, false, "History storage is unavailable");
+  } else {
+    sendPhoneMessage(500, false, "History storage operation failed");
+  }
+}
+
+void handlePhoneHistorySave() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  if (!historyStore.ready()) {
+    sendPhoneMessage(503, false, "History storage is unavailable");
+    return;
+  }
+
+  uint32_t lockToken = 0;
+  uint64_t timestampMs = 0;
+  long timezoneOffset = 0;
+  String name;
+  String notes;
+  String timezone;
+  if (!phoneWebServer.hasArg("lockToken") ||
+      !parsePhoneUint32(phoneWebServer.arg("lockToken"), lockToken)) {
+    sendPhoneMessage(400, false, "Weight-lock token is invalid");
+    return;
+  }
+  if (!readHistoryTimestamp(timestampMs)) {
+    return;
+  }
+  if (!phoneWebServer.hasArg("timezoneOffsetMinutes") ||
+      !parsePhoneLong(phoneWebServer.arg("timezoneOffsetMinutes"),
+                      timezoneOffset) ||
+      timezoneOffset < HISTORY_MIN_TIMEZONE_OFFSET_MINUTES ||
+      timezoneOffset > HISTORY_MAX_TIMEZONE_OFFSET_MINUTES) {
+    sendPhoneMessage(400, false, "Phone timezone offset is invalid");
+    return;
+  }
+  if (!readHistoryTextFields(name, notes)) {
+    return;
+  }
+  timezone = phoneWebServer.hasArg("timezone")
+                 ? phoneWebServer.arg("timezone")
+                 : String("Unknown");
+  timezone.trim();
+  if (!validUtf8Text(timezone,
+                     ScaleHistory::TIMEZONE_CAPACITY - 1,
+                     false,
+                     false)) {
+    sendPhoneMessage(400, false, "Phone timezone is invalid or too long");
+    return;
+  }
+
+  if (weightLockPhase != WeightLockPhase::Locked ||
+      lockedWeightSnapshot.mode == CombinedMode::None ||
+      lockToken != currentWeightLockToken) {
+    sendPhoneMessage(409,
+                     false,
+                     "Locked weight changed; reopen Save Log");
+    return;
+  }
+  if (currentWeightLockSaved) {
+    sendPhoneMessage(409,
+                     false,
+                     "This locked weight is already in history");
+    return;
+  }
+
+  // Copy the authoritative lock and health snapshot before touching flash.
+  const WeightSnapshot snapshot = lockedWeightSnapshot;
+  ScaleHistory::Record record;
+  record.loggedAtMs = timestampMs;
+  record.updatedAtMs = timestampMs;
+  record.timezoneOffsetMinutes = static_cast<int16_t>(timezoneOffset);
+  record.combinedMode = static_cast<uint8_t>(snapshot.mode);
+  record.totalGrams = snapshot.totalGrams;
+  strlcpy(record.timezone, timezone.c_str(), sizeof(record.timezone));
+  strlcpy(record.name, name.c_str(), sizeof(record.name));
+  strlcpy(record.notes, notes.c_str(), sizeof(record.notes));
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    const uint8_t bit = 1U << index;
+    if (snapshot.scaleIncluded[index]) {
+      record.includedMask |= bit;
+      record.scaleGrams[index] = snapshot.scaleGrams[index];
+    }
+    if (scaleStates[index].connected &&
+        scaleStates[index].identityVerified) {
+      record.connectionMask |= bit;
+    }
+    record.scaleStatus[index] =
+        static_cast<uint8_t>(scaleStates[index].status);
+    record.scaleFlags[index] = scaleStates[index].flags;
+  }
+
+  const bool wasFull = historyStore.count() >= historyStore.capacity();
+  const ScaleHistory::Result result = historyStore.add(record);
+  if (result != ScaleHistory::Result::Ok) {
+    sendHistoryStoreFailure(result);
+    return;
+  }
+  currentWeightLockSaved = true;
+  currentWeightLockRecordId = record.id;
+  const String displayId = historyDisplayId(record.id);
+  showNotice("Saved " + displayId + " to history", 3000);
+
+  String json;
+  json.reserve(180);
+  json = "{\"ok\":true,\"id\":";
+  json += static_cast<unsigned long>(record.id);
+  json += ",\"displayId\":";
+  appendJsonString(json, displayId);
+  json += ",\"message\":";
+  appendJsonString(json,
+                   wasFull
+                       ? displayId +
+                             " saved; the oldest entry was removed"
+                       : displayId + " saved to history");
+  json += '}';
+  sendPhoneJson(201, json);
+}
+
+struct HistoryListVisitContext {
+  String *json = nullptr;
+  const String *query = nullptr;
+  size_t offset = 0;
+  size_t limit = 0;
+  size_t matchingCount = 0;
+  size_t returnedCount = 0;
+};
+
+bool appendHistoryListRecord(const ScaleHistory::Record &record,
+                             void *opaqueContext) {
+  HistoryListVisitContext &context =
+      *static_cast<HistoryListVisitContext *>(opaqueContext);
+  if (context.query != nullptr && !context.query->isEmpty()) {
+    String searchable = historyDisplayId(record.id) + " " + record.name;
+    searchable.toLowerCase();
+    if (searchable.indexOf(*context.query) < 0) {
+      return true;
+    }
+  }
+
+  const size_t matchIndex = context.matchingCount++;
+  if (matchIndex < context.offset ||
+      context.returnedCount >= context.limit) {
+    return true;
+  }
+  if (context.returnedCount++ != 0) {
+    *context.json += ',';
+  }
+  appendHistoryRecordJson(*context.json, record, false);
+  return true;
+}
+
+void handlePhoneHistoryList() {
+  if (!historyStore.ready()) {
+    sendPhoneMessage(503, false, "History storage is unavailable");
+    return;
+  }
+
+  long requestedOffset = 0;
+  long requestedLimit = HISTORY_PAGE_DEFAULT_LIMIT;
+  if (phoneWebServer.hasArg("offset") &&
+      (!parsePhoneLong(phoneWebServer.arg("offset"), requestedOffset) ||
+       requestedOffset < 0 || requestedOffset > ScaleHistory::MAX_RECORDS)) {
+    sendPhoneMessage(400, false, "History offset is invalid");
+    return;
+  }
+  if (phoneWebServer.hasArg("limit") &&
+      (!parsePhoneLong(phoneWebServer.arg("limit"), requestedLimit) ||
+       requestedLimit < 1 || requestedLimit > HISTORY_PAGE_MAX_LIMIT)) {
+    sendPhoneMessage(400, false, "History limit must be 1 to 20");
+    return;
+  }
+
+  String query = phoneWebServer.hasArg("q")
+                     ? phoneWebServer.arg("q")
+                     : String();
+  query.trim();
+  if (!validUtf8Text(query, 50, true, false)) {
+    sendPhoneMessage(400, false, "History search is invalid");
+    return;
+  }
+  query.toLowerCase();
+
+  String json;
+  json.reserve(512 + requestedLimit * 260);
+  json = "{\"ok\":true,\"count\":";
+  json += static_cast<unsigned int>(historyStore.count());
+  json += ",\"capacity\":";
+  json += static_cast<unsigned int>(historyStore.capacity());
+  json += ",\"offset\":";
+  json += requestedOffset;
+  json += ",\"records\":[";
+
+  HistoryListVisitContext visitContext;
+  visitContext.json = &json;
+  visitContext.query = &query;
+  visitContext.offset = static_cast<size_t>(requestedOffset);
+  visitContext.limit = static_cast<size_t>(requestedLimit);
+  const ScaleHistory::Result visitResult =
+      historyStore.visitNewest(appendHistoryListRecord, &visitContext);
+  if (visitResult != ScaleHistory::Result::Ok) {
+    sendHistoryStoreFailure(visitResult);
+    return;
+  }
+  json += "],\"matchingCount\":";
+  json += static_cast<unsigned int>(visitContext.matchingCount);
+  json += ",\"hasMore\":";
+  appendJsonBool(json,
+                 visitContext.offset + visitContext.returnedCount <
+                     visitContext.matchingCount);
+  json += '}';
+  sendPhoneJson(200, json);
+}
+
+void handlePhoneHistoryDetail() {
+  uint32_t id = 0;
+  if (!phoneWebServer.hasArg("id") ||
+      !parsePhoneUint32(phoneWebServer.arg("id"), id)) {
+    sendPhoneMessage(400, false, "History ID is invalid");
+    return;
+  }
+  ScaleHistory::Record record;
+  const ScaleHistory::Result result = historyStore.get(id, record);
+  if (result != ScaleHistory::Result::Ok) {
+    sendHistoryStoreFailure(result);
+    return;
+  }
+  String json;
+  json.reserve(1500);
+  json = "{\"ok\":true,\"record\":";
+  appendHistoryRecordJson(json, record, true);
+  json += '}';
+  sendPhoneJson(200, json);
+}
+
+void handlePhoneHistoryUpdate() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  uint32_t id = 0;
+  uint32_t revision = 0;
+  uint64_t timestampMs = 0;
+  String name;
+  String notes;
+  if (!phoneWebServer.hasArg("id") ||
+      !parsePhoneUint32(phoneWebServer.arg("id"), id)) {
+    sendPhoneMessage(400, false, "History ID is invalid");
+    return;
+  }
+  if (!phoneWebServer.hasArg("revision") ||
+      !parsePhoneUint32(phoneWebServer.arg("revision"), revision) ||
+      revision > UINT16_MAX) {
+    sendPhoneMessage(400, false, "History revision is invalid");
+    return;
+  }
+  if (!readHistoryTimestamp(timestampMs) ||
+      !readHistoryTextFields(name, notes)) {
+    return;
+  }
+
+  const ScaleHistory::Result result =
+      historyStore.edit(id,
+                        static_cast<uint16_t>(revision),
+                        name.c_str(),
+                        notes.c_str(),
+                        timestampMs);
+  if (result != ScaleHistory::Result::Ok) {
+    sendHistoryStoreFailure(result);
+    return;
+  }
+  ScaleHistory::Record updated;
+  if (historyStore.get(id, updated) != ScaleHistory::Result::Ok) {
+    sendPhoneMessage(500, false, "Entry saved but could not be reloaded");
+    return;
+  }
+  String json;
+  json.reserve(1400);
+  json = "{\"ok\":true,\"message\":\"Details updated\",\"record\":";
+  appendHistoryRecordJson(json, updated, true);
+  json += '}';
+  sendPhoneJson(200, json);
+}
+
+void handlePhoneHistoryDelete() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  uint32_t id = 0;
+  if (!phoneWebServer.hasArg("id") ||
+      !parsePhoneUint32(phoneWebServer.arg("id"), id)) {
+    sendPhoneMessage(400, false, "History ID is invalid");
+    return;
+  }
+  const ScaleHistory::Result result = historyStore.remove(id);
+  if (result != ScaleHistory::Result::Ok) {
+    sendHistoryStoreFailure(result);
+    return;
+  }
+  if (id == currentWeightLockRecordId) {
+    currentWeightLockSaved = false;
+    currentWeightLockRecordId = 0;
+  }
+  sendPhoneMessage(200, true, historyDisplayId(id) + " deleted");
+}
+
+void handlePhoneHistoryClear() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  if (!phoneWebServer.hasArg("confirm") ||
+      phoneWebServer.arg("confirm") != "DELETE_ALL") {
+    sendPhoneMessage(400, false, "Clear confirmation was not accepted");
+    return;
+  }
+  const ScaleHistory::Result result = historyStore.clear();
+  if (result != ScaleHistory::Result::Ok) {
+    sendHistoryStoreFailure(result);
+    return;
+  }
+  currentWeightLockSaved = false;
+  currentWeightLockRecordId = 0;
+  sendPhoneMessage(200, true, "All history entries deleted");
+}
+
+void appendCsvField(String &line,
+                    const String &value,
+                    bool protectFromFormula = true) {
+  String safeValue = value;
+  if (protectFromFormula) {
+    size_t firstVisible = 0;
+    while (firstVisible < safeValue.length() &&
+           (safeValue.charAt(firstVisible) == ' ' ||
+            safeValue.charAt(firstVisible) == '\t')) {
+      ++firstVisible;
+    }
+    if (firstVisible < safeValue.length()) {
+      const char first = safeValue.charAt(firstVisible);
+      if (first == '=' || first == '+' || first == '-' || first == '@') {
+        safeValue = "'" + safeValue;
+      }
+    }
+  }
+  line += '"';
+  for (size_t index = 0; index < safeValue.length(); ++index) {
+    const char character = safeValue.charAt(index);
+    if (character == '"') {
+      line += "\"\"";
+    } else {
+      line += character;
+    }
+  }
+  line += '"';
+}
+
+String historyUtcIso(uint64_t timestampMs) {
+  const time_t seconds = static_cast<time_t>(timestampMs / 1000ULL);
+  struct tm utcTime = {};
+  if (gmtime_r(&seconds, &utcTime) == nullptr) {
+    return String();
+  }
+  char buffer[24];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utcTime);
+  return String(buffer);
+}
+
+struct HistoryCsvVisitContext {
+  uint16_t recordsSent = 0;
+};
+
+bool sendHistoryCsvRecord(const ScaleHistory::Record &record,
+                          void *opaqueContext) {
+  HistoryCsvVisitContext &context =
+      *static_cast<HistoryCsvVisitContext *>(opaqueContext);
+  String line;
+  line.reserve(900);
+  appendCsvField(line, historyDisplayId(record.id), false);
+  line += ',';
+  appendCsvField(line, String(record.name));
+  line += ',';
+  appendCsvField(line, String(record.notes));
+  line += ',';
+  appendCsvField(line, historyUtcIso(record.loggedAtMs), false);
+  line += ',';
+  char epochBuffer[24];
+  snprintf(epochBuffer,
+           sizeof(epochBuffer),
+           "%llu",
+           static_cast<unsigned long long>(record.loggedAtMs));
+  appendCsvField(line, String(epochBuffer), false);
+  line += ',';
+  appendCsvField(line, String(record.timezone));
+  line += ',';
+  appendCsvField(line, String(record.timezoneOffsetMinutes), false);
+  line += ',';
+  appendCsvField(line, String(record.totalGrams / 1000.0f, 3), false);
+  for (uint8_t scaleIndex = 0; scaleIndex < REMOTE_SCALE_COUNT;
+       ++scaleIndex) {
+    line += ',';
+    appendCsvField(
+        line,
+        (record.includedMask & (1U << scaleIndex)) != 0
+            ? String(record.scaleGrams[scaleIndex] / 1000.0f, 3)
+            : String(),
+        false);
+  }
+  line += ',';
+  appendCsvField(line, historyModeLabel(record.combinedMode), false);
+  for (uint8_t scaleIndex = 0; scaleIndex < REMOTE_SCALE_COUNT;
+       ++scaleIndex) {
+    const uint8_t bit = 1U << scaleIndex;
+    const uint8_t flags = record.scaleFlags[scaleIndex];
+    line += ',';
+    appendCsvField(line,
+                   (record.connectionMask & bit) != 0 ? "Yes" : "No",
+                   false);
+    line += ',';
+    appendCsvField(line,
+                   historyScaleStatusLabel(record.scaleStatus[scaleIndex]),
+                   false);
+    line += ',';
+    appendCsvField(
+        line,
+        (flags & DualScaleBle::TelemetryFlag::SensorPresent) != 0
+            ? "Yes"
+            : "No",
+        false);
+    line += ',';
+    appendCsvField(
+        line,
+        (flags & DualScaleBle::TelemetryFlag::AdcResponding) != 0
+            ? "Yes"
+            : "No",
+        false);
+    line += ',';
+    appendCsvField(
+        line,
+        (flags & DualScaleBle::TelemetryFlag::OledPresent) != 0
+            ? "Yes"
+            : "No",
+        false);
+  }
+  line += "\r\n";
+  phoneWebServer.sendContent(line);
+  ++context.recordsSent;
+  if ((context.recordsSent % 5U) == 0U) {
+    processBleUiEvents();
+  }
+  delay(0);
+  return true;
+}
+
+void handlePhoneHistoryCsv() {
+  if (!historyStore.ready()) {
+    sendPhoneMessage(503, false, "History storage is unavailable");
+    return;
+  }
+  phoneWebServer.sendHeader("Cache-Control", "no-store, max-age=0");
+  phoneWebServer.sendHeader(
+      "Content-Disposition",
+      "attachment; filename=weighing-scale-history.csv");
+  phoneWebServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  phoneWebServer.send(200, "text/csv; charset=utf-8", "");
+  phoneWebServer.sendContent(
+      "ID,Name,Notes,Logged UTC,Epoch ms,Timezone,UTC-minus-local minutes,"
+      "Total kg,Load Cell A kg,Load Cell B kg,Mode,A connected,A status,"
+      "A sensor,A ADC,A OLED,B connected,B status,B sensor,B ADC,B OLED\r\n");
+
+  HistoryCsvVisitContext visitContext;
+  const ScaleHistory::Result visitResult =
+      historyStore.visitNewest(sendHistoryCsvRecord, &visitContext);
+  if (visitResult != ScaleHistory::Result::Ok) {
+    Serial.println("WARNING: History CSV export stopped after a storage error.");
+  }
+  phoneWebServer.sendContent("");
+}
+
+void handlePhoneTare() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  uint8_t targetMask = 0;
+  if (!phoneWebServer.hasArg("target") ||
+      !parsePhoneTarget(phoneWebServer.arg("target"), targetMask, true)) {
+    sendPhoneMessage(400, false, "Tare target must be A, B, or both");
+    return;
+  }
+  const ControlActionResult result =
+      requestControllerTare(targetMask, "phone tare command");
+  sendPhoneMessage(result.httpStatus, result.accepted, result.message);
+}
+
+void handlePhoneCalibration() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  uint8_t targetMask = 0;
+  int32_t valueGrams = 0;
+  if (!phoneWebServer.hasArg("target") ||
+      !parsePhoneTarget(phoneWebServer.arg("target"), targetMask, false)) {
+    sendPhoneMessage(400, false, "Calibration target must be A or B");
+    return;
+  }
+  if (!phoneWebServer.hasArg("kg") ||
+      !parsePhoneCalibrationGrams(phoneWebServer.arg("kg"), valueGrams)) {
+    sendPhoneMessage(400,
+                     false,
+                     "Calibration weight must be 0.1 to 100 kg");
+    return;
+  }
+  const uint8_t scaleIndex = targetMask == 0x01 ? 0 : 1;
+  const ControlActionResult result =
+      requestControllerCalibration(scaleIndex,
+                                   valueGrams,
+                                   "phone calibration command");
+  sendPhoneMessage(result.httpStatus, result.accepted, result.message);
+}
+
+void handlePhoneUnlock() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  const ControlActionResult result =
+      requestControllerUnlock("phone UNLOCK button");
+  sendPhoneMessage(result.httpStatus, result.accepted, result.message);
+}
+
+void handlePhoneReconnect() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  uint8_t targetMask = 0;
+  if (!phoneWebServer.hasArg("target") ||
+      !parsePhoneTarget(phoneWebServer.arg("target"), targetMask, true)) {
+    sendPhoneMessage(400, false, "Connection target must be A, B, or both");
+    return;
+  }
+
+  bool actionQueued = false;
+  bool needsDiscovery = false;
+  const uint32_t now = millis();
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    if ((targetMask & (1U << index)) == 0) {
+      continue;
+    }
+
+    ScaleState &state = scaleStates[index];
+    const bool telemetryFresh =
+        state.lastTelemetryMs != 0 &&
+        now - state.lastTelemetryMs <= TELEMETRY_STALE_MS;
+    if (state.connected && state.identityVerified && telemetryFresh) {
+      if (state.pendingToken == 0) {
+        actionQueued |=
+            queueScaleCommand(index, DualScaleBle::CommandType::Status);
+      }
+    } else if (state.connected) {
+      // A nominal connection with no fresh verified telemetry is not useful.
+      // Restart it so CHECK LINKS can recover a stuck GATT session.
+      actionQueued |= requestBleReconnect(index);
+    } else {
+      needsDiscovery = true;
+    }
+  }
+
+  if (needsDiscovery) {
+    BleManagerMessage forceMessage;
+    forceMessage.type = BleManagerMessageType::ForceCheck;
+    actionQueued |= queueBleManagerMessage(forceMessage);
+  }
+  if (!actionQueued) {
+    sendPhoneMessage(409,
+                     false,
+                     "Link check is already running; please wait");
+    return;
+  }
+  showNotice(targetMask == 0x03 ? "Checking both scales..."
+                                : targetMask == 0x01
+                                      ? "Checking Load Cell A..."
+                                      : "Checking Load Cell B...",
+             1800);
+  sendPhoneMessage(202, true, "Connection check started");
+}
+
+void handlePhoneBrightness() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  long requestedPercent = 0;
+  if (!phoneWebServer.hasArg("percent") ||
+      !parsePhoneLong(phoneWebServer.arg("percent"), requestedPercent) ||
+      requestedPercent < MIN_BRIGHTNESS_PERCENT ||
+      requestedPercent > MAX_BRIGHTNESS_PERCENT ||
+      requestedPercent % BRIGHTNESS_STEP_PERCENT != 0) {
+    sendPhoneMessage(400, false, "Brightness must be 10 to 100 percent");
+    return;
+  }
+  adjustBrightness(static_cast<int>(requestedPercent) -
+                   static_cast<int>(brightnessPercent));
+  sendPhoneMessage(200,
+                   true,
+                   "Brightness set to " + String(brightnessPercent) + "%");
+}
+
+void handlePhoneCpuFrequency() {
+  if (!validatePhonePost()) {
+    return;
+  }
+  long requestedMhz = 0;
+  if (!phoneWebServer.hasArg("mhz") ||
+      !parsePhoneLong(phoneWebServer.arg("mhz"), requestedMhz) ||
+      !supportedCpuFrequency(static_cast<uint16_t>(requestedMhz))) {
+    sendPhoneMessage(400, false, "CPU clock must be 160 or 240 MHz");
+    return;
+  }
+  selectCpuFrequency(static_cast<uint16_t>(requestedMhz));
+  const bool applied = cpuFrequencyMhz == requestedMhz;
+  sendPhoneMessage(applied ? 200 : 500,
+                   applied,
+                   applied ? "CPU clock set to " + String(cpuFrequencyMhz) +
+                                 " MHz"
+                           : "CPU clock change failed");
+}
+
+void handlePhoneNotFound() {
+  if (phoneWebServer.uri().startsWith("/api/")) {
+    sendPhoneMessage(404, false, "API endpoint not found");
+    return;
+  }
+  phoneWebServer.sendHeader(
+      "Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+  phoneWebServer.send(302, "text/plain", "Open the weighing-scale control page");
+}
+
+void beginPhoneControl() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP);
+  const IPAddress address(192, 168, 4, 1);
+  const IPAddress gateway(192, 168, 4, 1);
+  const IPAddress subnet(255, 255, 255, 0);
+  if (!WiFi.softAPConfig(address, gateway, subnet)) {
+    Serial.println("Warning: phone-control SoftAP IP configuration failed.");
+  }
+  if (!WiFi.softAP(PHONE_WIFI_SSID,
+                   PHONE_WIFI_PASSWORD,
+                   PHONE_WIFI_CHANNEL,
+                   false,
+                   PHONE_WIFI_MAX_CLIENTS)) {
+    Serial.println("ERROR: Phone-control Wi-Fi access point failed to start.");
+    phoneControlReady = false;
+    return;
+  }
+
+  const char *collectedHeaders[] = {"X-Scale-Control"};
+  phoneWebServer.collectHeaders(collectedHeaders, 1);
+  phoneWebServer.on("/", HTTP_GET, handlePhoneRoot);
+  phoneWebServer.on("/api/v1/status", HTTP_GET, handlePhoneStatus);
+  phoneWebServer.on("/api/v1/history", HTTP_GET, handlePhoneHistoryList);
+  phoneWebServer.on("/api/v1/history/detail",
+                    HTTP_GET,
+                    handlePhoneHistoryDetail);
+  phoneWebServer.on("/api/v1/history/export.csv",
+                    HTTP_GET,
+                    handlePhoneHistoryCsv);
+  phoneWebServer.on("/api/v1/history/save",
+                    HTTP_POST,
+                    handlePhoneHistorySave);
+  phoneWebServer.on("/api/v1/history/update",
+                    HTTP_POST,
+                    handlePhoneHistoryUpdate);
+  phoneWebServer.on("/api/v1/history/delete",
+                    HTTP_POST,
+                    handlePhoneHistoryDelete);
+  phoneWebServer.on("/api/v1/history/clear",
+                    HTTP_POST,
+                    handlePhoneHistoryClear);
+  phoneWebServer.on("/api/v1/tare", HTTP_POST, handlePhoneTare);
+  phoneWebServer.on("/api/v1/calibrate", HTTP_POST, handlePhoneCalibration);
+  phoneWebServer.on("/api/v1/unlock", HTTP_POST, handlePhoneUnlock);
+  phoneWebServer.on("/api/v1/reconnect", HTTP_POST, handlePhoneReconnect);
+  phoneWebServer.on("/api/v1/display/brightness",
+                    HTTP_POST,
+                    handlePhoneBrightness);
+  phoneWebServer.on("/api/v1/display/cpu",
+                    HTTP_POST,
+                    handlePhoneCpuFrequency);
+  phoneWebServer.on("/favicon.ico", HTTP_GET, []() {
+    phoneWebServer.send(204, "image/x-icon", "");
+  });
+  phoneWebServer.onNotFound(handlePhoneNotFound);
+  phoneWebServer.begin();
+  phoneControlReady = true;
+
+  Serial.println("Phone control Wi-Fi ready.");
+  Serial.print("  Network: ");
+  Serial.println(PHONE_WIFI_SSID);
+  Serial.print("  Password: ");
+  Serial.println(PHONE_WIFI_PASSWORD);
+  Serial.print("  Open: http://");
+  Serial.println(WiFi.softAPIP());
+}
+
+void servicePhoneControl() {
+  if (!phoneControlReady) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (lastPhoneClientCheckMs == 0 ||
+      now - lastPhoneClientCheckMs >= PHONE_CLIENT_CHECK_INTERVAL_MS) {
+    lastPhoneClientCheckMs = now;
+    const uint8_t connectedClients = WiFi.softAPgetStationNum();
+    if (connectedClients != phoneClientCount) {
+      phoneClientCount = connectedClients;
+      Serial.printf("Phone-control clients: %u.\n", phoneClientCount);
+    }
+  }
+  phoneWebServer.handleClient();
+}
+
 } // namespace
 
 void setup() {
@@ -2947,6 +4627,21 @@ void setup() {
   drawCurrentPage();
   // Keep the backlight off until the first complete frame is ready.
   applyBacklightOutput(true);
+  if (historyStore.begin()) {
+    Serial.printf("History storage ready: %u/%u entries.\n",
+                  historyStore.count(),
+                  historyStore.capacity());
+  } else {
+    Serial.println(
+        "WARNING: History storage unavailable; existing data was not erased.");
+  }
+  // A fresh random starting token prevents a Save dialog left open on a phone
+  // across a display reboot from matching a different, newly locked weight.
+  currentWeightLockToken = esp_random();
+  if (currentWeightLockToken == 0) {
+    currentWeightLockToken = 1;
+  }
+  beginPhoneControl();
   if (!startBleManager()) {
     showNotice("BLE manager failed", 5000);
   }
@@ -2955,6 +4650,7 @@ void setup() {
 
 void loop() {
   processBleUiEvents();
+  servicePhoneControl();
 
   for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
     ScaleState &state = scaleStates[index];
@@ -3023,7 +4719,10 @@ void loop() {
         processTouch(sample, !touchWasDown);
       }
     }
+    serviceCalibrationWeightRepeat(touched ? &sample : nullptr);
     touchWasDown = touched;
+  } else {
+    finishCalibrationWeightRepeat(false);
   }
 
   if (currentPage == Page::Connectivity && !screenSleeping &&
