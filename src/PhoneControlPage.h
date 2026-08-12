@@ -10,113 +10,144 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#071b22">
+  <meta name="theme-color" content="#06131e">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Weighing Scale">
   <title>Dual Load-Cell Control</title>
   <style>
     :root {
-      color-scheme: dark;
-      --bg:#071b22; --panel:#102b34; --panel2:#173b46;
-      --line:#315762; --text:#f5fbfc; --muted:#9db4ba;
-      --cyan:#23b8d0; --green:#35d07f; --orange:#ffad42; --red:#ff646d;
+      color-scheme:dark;
+      --bg:#06131e; --panel:#0b1f2b; --panel2:#102a38;
+      --line:#29495d; --text:#f4f8fb; --muted:#8aa1b2;
+      --cyan:#159cf3; --cyan2:#55c7ff; --green:#3edc73;
+      --orange:#f2b435; --red:#f04444;
     }
     * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
     body {
-      margin:0; min-height:100vh; background:linear-gradient(180deg,#06171d,#0b222a);
-      color:var(--text); font:15px/1.35 system-ui,-apple-system,Segoe UI,sans-serif;
+      margin:0; min-height:100vh; background:var(--bg);
+      color:var(--text); font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif;
     }
-    .wrap { width:min(920px,100%); margin:auto; padding:18px 14px 40px; }
-    header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin:3px 2px 18px; }
-    h1 { font-size:1.35rem; margin:0 0 4px; letter-spacing:.04em; }
-    h2 { font-size:1rem; margin:0 0 12px; letter-spacing:.05em; }
+    .wrap { width:min(980px,100%); margin:auto; padding:0 12px 34px; }
+    header { display:flex; justify-content:space-between; gap:12px; align-items:center; min-height:70px; border-bottom:1px solid var(--line); padding:12px 2px; }
+    h1 { font-size:1.12rem; margin:0 0 2px; letter-spacing:.08em; }
+    h2 { font-size:.88rem; margin:0 0 10px; letter-spacing:.07em; }
     .sub,.small { color:var(--muted); font-size:.82rem; }
     .connection { display:flex; align-items:center; gap:7px; white-space:nowrap; color:var(--muted); font-size:.82rem; }
-    .dot { width:10px; height:10px; border-radius:50%; background:var(--orange); box-shadow:0 0 12px currentColor; }
+    .dot { width:9px; height:9px; border-radius:50%; background:var(--orange); }
     .dot.ok { background:var(--green); color:var(--green); }
     .dot.bad { background:var(--red); color:var(--red); }
-    .card { background:var(--panel); border:1px solid var(--line); border-radius:15px; padding:15px; box-shadow:0 10px 28px #0004; }
-    .total { border-color:var(--cyan); margin-bottom:12px; text-align:center; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .total { border-color:var(--cyan); margin:14px 0 10px; text-align:center; }
     .eyebrow { color:var(--muted); font-size:.76rem; letter-spacing:.13em; text-transform:uppercase; }
-    .bigweight { font-size:clamp(2.5rem,12vw,4.5rem); font-weight:750; letter-spacing:-.04em; margin:2px 0; }
+    .bigweight { color:var(--cyan2); font-size:clamp(3.5rem,18vw,5.3rem); font-weight:720; line-height:1; letter-spacing:-.05em; margin:10px 0 7px; font-variant-numeric:tabular-nums; }
     .unit { color:var(--muted); font-size:1rem; margin-left:5px; letter-spacing:0; }
     .row { display:flex; align-items:center; justify-content:space-between; gap:9px; }
     .grid { display:grid; gap:12px; }
-    .scales { grid-template-columns:1fr; margin-bottom:12px; }
-    .scale-card { border-width:1px; }
-    .scale-weight { font-size:2rem; font-weight:700; margin:7px 0 10px; }
-    .pill { border:1px solid var(--line); border-radius:999px; padding:4px 9px; color:var(--muted); font-size:.72rem; font-weight:700; }
+    .scales { grid-template-columns:minmax(0,1fr) minmax(0,1fr); margin-bottom:10px; gap:10px; }
+    .scale-card { border-width:1px; min-width:0; }
+    .scale-weight { color:var(--cyan2); font-size:clamp(1.75rem,9vw,2.7rem); font-weight:680; line-height:1; margin:12px 0; font-variant-numeric:tabular-nums; }
+    .pill { border:1px solid var(--line); border-radius:5px; padding:3px 7px; color:var(--muted); font-size:.68rem; font-weight:750; letter-spacing:.04em; }
     .pill.good { color:var(--green); border-color:var(--green); }
     .pill.warn { color:var(--orange); border-color:var(--orange); }
     .pill.bad { color:var(--red); border-color:var(--red); }
     .pill.locked { color:var(--cyan); border-color:var(--cyan); }
-    dl { display:grid; grid-template-columns:1fr auto; gap:7px 10px; margin:10px 0 14px; font-size:.82rem; }
+    dl { display:grid; grid-template-columns:1fr auto; gap:6px 8px; margin:10px 0 13px; padding-top:10px; border-top:1px solid var(--line); font-size:.77rem; }
     dt { color:var(--muted); } dd { margin:0; text-align:right; }
-    .controls { display:grid; grid-template-columns:1fr 1fr; gap:9px; }
-    button,input,textarea { font:inherit; }
+    .controls { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:9px; }
+    button,input,textarea { font:inherit; min-width:0; max-width:100%; }
     button {
-      min-height:44px; border-radius:10px; border:1px solid var(--cyan);
-      background:#123c48; color:var(--text); font-weight:700; padding:8px 10px; cursor:pointer;
+      min-height:46px; border-radius:6px; border:1px solid var(--cyan);
+      min-width:0; background:#0c6fc4; color:var(--text); font-weight:750; padding:8px 7px; cursor:pointer; letter-spacing:.025em; overflow-wrap:anywhere;
     }
-    button.secondary { border-color:var(--line); background:var(--panel2); }
-    button.warning { border-color:var(--orange); }
+    button.secondary { border-color:var(--line); background:transparent; }
+    button.warning { border-color:var(--orange); background:#4b3510; }
     button:disabled { opacity:.38; cursor:not-allowed; }
     .wide { width:100%; }
-    .actions { grid-template-columns:repeat(2,1fr); margin-bottom:12px; }
+    .actions { grid-template-columns:repeat(2,minmax(0,1fr)); margin-bottom:12px; }
     .section-grid { grid-template-columns:1fr; margin-bottom:12px; }
     .cal-row { display:grid; grid-template-columns:1fr auto; gap:9px; align-items:end; margin-top:10px; }
     label { display:block; color:var(--muted); font-size:.8rem; }
     input[type=number],input[type=text],input[type=search],textarea {
-      width:100%; min-height:44px; margin-top:5px; border-radius:9px; border:1px solid var(--line);
-      background:#071b22; color:var(--text); padding:8px 10px; font-size:1rem;
+      width:100%; min-height:44px; margin-top:5px; border-radius:5px; border:1px solid var(--line);
+      background:var(--bg); color:var(--text); padding:8px 10px; font-size:1rem;
     }
     textarea { min-height:112px; resize:vertical; }
     input[type=range] { width:100%; accent-color:var(--cyan); }
-    .settings-row { display:grid; grid-template-columns:1fr auto; align-items:center; gap:14px; margin:14px 0; }
+    .settings-row { display:grid; grid-template-columns:1fr auto; align-items:center; gap:14px; margin:17px 0; }
     .cpu { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     .mode-controls { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; }
     #message { display:none; position:sticky; bottom:12px; z-index:4; margin-top:12px; padding:12px 14px; border-radius:11px; background:#163943; border:1px solid var(--cyan); box-shadow:0 8px 28px #0008; }
     #message.bad { border-color:var(--red); color:#ffd9dc; }
-    .tabs { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:12px; }
+    .tabs { position:sticky; bottom:0; z-index:8; display:grid; grid-template-columns:repeat(4,1fr); gap:0; margin:16px -12px 0; border-top:1px solid var(--line); background:#071722f5; padding-bottom:env(safe-area-inset-bottom); }
+    .tabs button { min-height:59px; border:0; border-radius:0; background:transparent; color:var(--muted); padding:7px 2px; font-size:.72rem; }
+    .tabs button.active { color:var(--cyan2); border-top:2px solid var(--cyan); }
+    .tabs button::before { display:block; font-size:1.1rem; line-height:1.2; margin-bottom:3px; }
+    #controlTab::before { content:'\2696'; } #historyTab::before { content:'\2637'; }
+    #diagnosticsTab::before { content:'\223F'; } #settingsTab::before { content:'\2699'; }
     .hidden { display:none!important; }
     .history-tools { display:grid; grid-template-columns:1fr auto; gap:8px; margin:10px 0; }
     .history-list { display:grid; gap:9px; margin:12px 0; }
-    .history-item { background:var(--panel2); border:1px solid var(--line); border-radius:11px; padding:12px; }
+    .history-item { background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:12px; }
     .history-name { font-weight:750; overflow-wrap:anywhere; }
     .history-meta { color:var(--muted); font-size:.78rem; margin-top:4px; }
     .history-weight { color:var(--cyan); font-size:1.35rem; font-weight:750; }
     .history-footer { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     .danger { border-color:var(--red)!important; color:#ffd9dc; }
     .modal { position:fixed; inset:0; z-index:20; display:grid; place-items:center; padding:14px; background:#000b; }
-    .dialog { width:min(560px,100%); max-height:92vh; overflow:auto; background:var(--panel); border:1px solid var(--cyan); border-radius:15px; padding:16px; box-shadow:0 20px 60px #000b; }
+    .dialog { width:min(560px,100%); max-height:92vh; overflow:auto; background:var(--panel); border:1px solid var(--cyan); border-radius:8px; padding:16px; box-shadow:0 20px 60px #000b; }
     .dialog-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px; }
     .detail-grid { display:grid; grid-template-columns:1fr auto; gap:7px 12px; margin:12px 0; font-size:.84rem; }
     .detail-grid span:nth-child(odd) { color:var(--muted); }
     .detail-grid span:nth-child(even) { text-align:right; overflow-wrap:anywhere; }
-    footer { text-align:center; color:var(--muted); margin-top:18px; font-size:.75rem; }
+    .view-title { display:flex; justify-content:space-between; align-items:end; gap:8px; margin:16px 2px 10px; }
+    .view-title h2 { margin:0; font-size:1.05rem; }
+    .diagnostic-heading { margin:14px 2px 10px; }
+    footer { text-align:center; color:var(--muted); margin:18px 0 4px; font-size:.72rem; }
+    body[data-view="diagnostics"] .dashboard-only { display:none!important; }
+    body:not([data-view="diagnostics"]) .diagnostics-only { display:none!important; }
+    body[data-view="diagnostics"] .scale-control { display:none!important; }
+    body[data-view="settings"] .dashboard-only,
+    body[data-view="settings"] .scales { display:none!important; }
     @media (min-width:720px) {
       .scales,.section-grid { grid-template-columns:1fr 1fr; }
-      .wrap { padding-top:25px; }
+      .wrap { padding-top:8px; }
+      .tabs { position:static; margin:16px 0 0; border:1px solid var(--line); border-radius:7px; overflow:hidden; }
+      .tabs button { min-height:48px; }
+      .tabs button::before { display:inline; margin-right:6px; }
+    }
+    @media (max-width:370px) {
+      .scales { grid-template-columns:1fr; }
+      .bigweight { font-size:3.7rem; }
+    }
+    @media (max-width:520px) {
+      .scales { grid-template-columns:calc((100vw - 34px)/2) calc((100vw - 34px)/2); }
+      .scale-card { padding:12px 10px; }
+      .scale-card .row { align-items:flex-start; flex-direction:column; }
+      .scale-card .controls { grid-template-columns:1fr; }
+      .scale-card button { min-height:42px; }
+      .connection { font-size:0; }
+    }
+    @media (orientation:landscape) and (max-height:520px) {
+      .wrap { width:min(1100px,100%); }
+      header { min-height:54px; }
+      .total { float:left; width:34%; margin-right:10px; }
+      .scales { grid-template-columns:1fr 1fr; }
+      .actions { clear:both; grid-template-columns:repeat(4,1fr); }
     }
   </style>
 </head>
 <body>
   <main class="wrap">
     <header>
-      <div><h1>DUAL LOAD-CELL CONTROL</h1><div class="sub">Touchscreen master &bull; local Wi-Fi</div></div>
+      <div><h1>DUAL LOAD CELL SCALE</h1><div class="sub">School of Engineering &bull; Temasek Polytechnic</div></div>
       <div class="connection"><span id="netDot" class="dot"></span><span id="netText">Connecting...</span></div>
     </header>
 
-    <nav class="tabs">
-      <button id="controlTab" onclick="switchView('control')">SCALE</button>
-      <button id="historyTab" class="secondary" onclick="switchView('history')">HISTORY (0)</button>
-    </nav>
-
     <div id="controlView">
 
-    <section class="card total">
-      <div class="row"><span class="eyebrow">Combined total</span><span id="lockPill" class="pill warn">WAITING</span></div>
+    <section class="card total dashboard-only">
+      <div class="row"><span class="eyebrow">Total</span><span id="lockPill" class="pill warn">WAITING</span></div>
       <div id="totalWeight" class="bigweight">--.--<span class="unit">kg</span></div>
       <div id="combinedMode" class="small">Waiting for scale data</div>
     </section>
@@ -133,8 +164,8 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
           <dt>Data age</dt><dd id="ageA">--</dd>
           <dt>Command</dt><dd id="pendingA">Idle</dd>
         </dl>
-        <div class="controls"><button id="tareA" onclick="tare('a')">TARE A</button><button id="calA" class="warning" onclick="calibrate('a')">CALIBRATE A</button></div>
-        <label style="margin-top:10px">Reference weight (kg)<input id="kgA" type="number" min="0.1" max="100" step="0.1" value="1.0" inputmode="decimal"></label>
+        <div class="controls scale-control"><button id="tareA" onclick="tare('a')">TARE A</button><button id="calA" class="warning" onclick="calibrate('a')">CALIBRATE A</button></div>
+        <label class="scale-control" style="margin-top:10px">Reference weight (kg)<input id="kgA" type="number" min="0.1" max="100" step="0.1" value="1.0" inputmode="decimal"></label>
       </article>
 
       <article class="card scale-card" id="cardB">
@@ -148,19 +179,20 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
           <dt>Data age</dt><dd id="ageB">--</dd>
           <dt>Command</dt><dd id="pendingB">Idle</dd>
         </dl>
-        <div class="controls"><button id="tareB" onclick="tare('b')">TARE B</button><button id="calB" class="warning" onclick="calibrate('b')">CALIBRATE B</button></div>
-        <label style="margin-top:10px">Reference weight (kg)<input id="kgB" type="number" min="0.1" max="100" step="0.1" value="1.0" inputmode="decimal"></label>
+        <div class="controls scale-control"><button id="tareB" onclick="tare('b')">TARE B</button><button id="calB" class="warning" onclick="calibrate('b')">CALIBRATE B</button></div>
+        <label class="scale-control" style="margin-top:10px">Reference weight (kg)<input id="kgB" type="number" min="0.1" max="100" step="0.1" value="1.0" inputmode="decimal"></label>
       </article>
     </section>
 
-    <section class="grid actions">
+    <section class="grid actions dashboard-only">
       <button id="tareAll" onclick="tare('all')">TARE BOTH</button>
       <button id="unlock" class="warning" onclick="unlockWeight()">UNLOCK</button>
       <button class="secondary" onclick="checkLinks()">CHECK LINKS</button>
       <button id="saveLog" onclick="openSaveLog()">SAVE LOG</button>
     </section>
 
-    <section class="grid section-grid">
+    <section id="settingsPanel" class="grid section-grid hidden">
+      <div class="view-title"><h2>SETTINGS</h2><span class="small">Display master</span></div>
       <article class="card">
         <h2>DISPLAY BRIGHTNESS</h2>
         <div class="settings-row"><input id="brightness" type="range" min="10" max="100" step="10" value="100" oninput="byId('brightnessText').textContent=this.value+'%'" onchange="setBrightness(this.value)"><strong id="brightnessText">100%</strong></div>
@@ -179,13 +211,22 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
     </section>
     </div>
 
-    <section id="historyView" class="card hidden">
-      <div class="row"><div><h2 style="margin:0">WEIGHT HISTORY</h2><div id="historyCount" class="small">0 of 100 entries</div></div><button class="secondary" onclick="loadHistory()">REFRESH</button></div>
+    <section id="historyView" class="hidden">
+      <div class="view-title"><div><h2>WEIGHT HISTORY</h2><div id="historyCount" class="small">0 of 100 entries</div></div><button class="secondary" onclick="loadHistory()">REFRESH</button></div>
+      <div class="card">
       <div class="history-tools"><input id="historySearch" type="search" maxlength="50" placeholder="Search ID or name" onkeydown="if(event.key==='Enter')searchHistory()"><button onclick="searchHistory()">SEARCH</button></div>
       <div class="controls"><button class="secondary" onclick="exportHistory()">EXPORT CSV</button><button class="danger" onclick="clearHistory()">CLEAR ALL</button></div>
       <div id="historyList" class="history-list"><div class="small">Open History to load saved entries.</div></div>
       <div class="history-footer"><button id="historyPrevious" class="secondary" onclick="changeHistoryPage(-1)">PREVIOUS</button><button id="historyNext" class="secondary" onclick="changeHistoryPage(1)">NEXT</button></div>
+      </div>
     </section>
+
+    <nav class="tabs">
+      <button id="controlTab" class="active" onclick="switchView('control')">SCALE</button>
+      <button id="historyTab" onclick="switchView('history')">HISTORY (0)</button>
+      <button id="diagnosticsTab" onclick="switchView('diagnostics')">DIAGNOSTICS</button>
+      <button id="settingsTab" onclick="switchView('settings')">SETTINGS</button>
+    </nav>
 
     <div id="message"></div>
     <footer>Connect directly to WEIGHING_SCALE &bull; no internet required</footer>
@@ -375,10 +416,14 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
 
     function switchView(view) {
       currentView = view;
-      byId('controlView').classList.toggle('hidden', view !== 'control');
+      document.body.dataset.view = view;
+      const controlVisible = view === 'control' || view === 'diagnostics' || view === 'settings';
+      byId('controlView').classList.toggle('hidden', !controlVisible);
       byId('historyView').classList.toggle('hidden', view !== 'history');
-      byId('controlTab').className = view === 'control' ? '' : 'secondary';
-      byId('historyTab').className = view === 'history' ? '' : 'secondary';
+      byId('settingsPanel').classList.toggle('hidden', view !== 'settings');
+      ['control','history','diagnostics','settings'].forEach(name => {
+        byId(name + 'Tab').classList.toggle('active', view === name);
+      });
       if (view === 'history') loadHistory(true);
     }
     function closeModal(id) { byId(id).classList.add('hidden'); }
@@ -541,6 +586,7 @@ const char PHONE_CONTROL_PAGE_HTML[] PROGMEM = R"PHONEPAGE(
       await refresh();
       setTimeout(pollLoop, document.hidden ? 3000 : 1000);
     }
+    document.body.dataset.view = 'control';
     pollLoop();
     document.addEventListener('visibilitychange', refresh);
   </script>

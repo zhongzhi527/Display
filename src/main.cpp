@@ -101,14 +101,14 @@ constexpr uint32_t SCALE_BORDER_ERROR_BLINK_MS = 800;
 constexpr uint32_t CALIBRATION_REPEAT_DELAY_MS = 500;
 constexpr uint32_t CALIBRATION_REPEAT_INTERVAL_MS = 150;
 
-constexpr uint16_t COLOR_BACKGROUND = 0x0861;
-constexpr uint16_t COLOR_PANEL = 0x10C3;
-constexpr uint16_t COLOR_PANEL_LIGHT = 0x2145;
-constexpr uint16_t COLOR_PRIMARY = 0x051F;
-constexpr uint16_t COLOR_SUCCESS = 0x05E8;
-constexpr uint16_t COLOR_WARNING = 0xFD20;
-constexpr uint16_t COLOR_DANGER = 0xF9C7;
-constexpr uint16_t COLOR_MUTED = 0x9CF3;
+constexpr uint16_t COLOR_BACKGROUND = 0x0083;
+constexpr uint16_t COLOR_PANEL = 0x08E5;
+constexpr uint16_t COLOR_PANEL_LIGHT = 0x1188;
+constexpr uint16_t COLOR_PRIMARY = 0x047E;
+constexpr uint16_t COLOR_SUCCESS = 0x3EEE;
+constexpr uint16_t COLOR_WARNING = 0xF5A6;
+constexpr uint16_t COLOR_DANGER = 0xF228;
+constexpr uint16_t COLOR_MUTED = 0x8D16;
 
 struct RemoteScaleDefinition {
   const char *bluetoothName;
@@ -1182,6 +1182,60 @@ void drawHeader(const String &title,
   }
 }
 
+void drawStartupScreen(const String &stage, uint8_t progressPercent) {
+  progressPercent = constrain(progressPercent, 0, 100);
+  tft.fillScreen(COLOR_BACKGROUND);
+
+  tft.setTextColor(COLOR_MUTED, COLOR_BACKGROUND);
+  tft.setTextSize(1);
+  tft.setCursor(33, 32);
+  tft.print("SCHOOL OF ENGINEERING");
+  tft.setCursor(54, 47);
+  tft.print("TEMASEK POLYTECHNIC");
+  tft.drawFastHLine(26, 67, 188, COLOR_PRIMARY);
+
+  setCenteredText("DUAL LOAD CELL", 120, 111, 2, TFT_WHITE,
+                  COLOR_BACKGROUND);
+  setCenteredText("SCALE", 120, 135, 2, TFT_WHITE, COLOR_BACKGROUND);
+  setCenteredText("SYSTEM STARTUP", 120, 161, 1, COLOR_PRIMARY,
+                  COLOR_BACKGROUND);
+
+  tft.fillRoundRect(18, 187, 204, 108, 8, COLOR_PANEL);
+  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setCursor(29, 197);
+  tft.print(stage);
+
+  char progressText[8];
+  snprintf(progressText, sizeof(progressText), "%u%%", progressPercent);
+  tft.setTextColor(TFT_WHITE, COLOR_PANEL);
+  tft.setCursor(187, 197);
+  tft.print(progressText);
+
+  tft.drawRoundRect(29, 215, 182, 12, 4, COLOR_PANEL_LIGHT);
+  const int16_t progressWidth =
+      static_cast<int16_t>((176L * progressPercent) / 100L);
+  if (progressWidth > 0) {
+    tft.fillRoundRect(32, 218, progressWidth, 6, 2, COLOR_PRIMARY);
+  }
+
+  const char *startupLabels[] = {"TOUCHSCREEN", "STORAGE", "BLE MANAGER"};
+  const uint8_t readyAt[] = {55, 75, 95};
+  for (uint8_t index = 0; index < 3; ++index) {
+    const int16_t y = 237 + index * 17;
+    const bool ready = progressPercent >= readyAt[index];
+    tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+    tft.setCursor(29, y);
+    tft.print(startupLabels[index]);
+    tft.setTextColor(ready ? COLOR_SUCCESS : COLOR_WARNING, COLOR_PANEL);
+    tft.setCursor(178, y);
+    tft.print(ready ? "OK" : "WAIT");
+  }
+
+  setCenteredText("Starting weighing controller...", 120, 307, 1,
+                  COLOR_MUTED, COLOR_PANEL);
+}
+
 String dashboardScaleStatus(uint8_t index) {
   const ScaleState &state = scaleStates[index];
   if (weightLockPhase == WeightLockPhase::Locked &&
@@ -1569,7 +1623,7 @@ void drawDashboardDynamic(bool force = false) {
 
 void drawDashboard() {
   tft.fillScreen(COLOR_BACKGROUND);
-  drawHeader("LOAD CELL", false, true);
+  drawHeader("DUAL SCALE", false, true);
 
   tft.fillRoundRect(6, 47, 228, 61, 8, COLOR_PANEL);
   tft.fillRoundRect(6, 112, 228, 61, 8, COLOR_PANEL);
@@ -5068,7 +5122,12 @@ void setup() {
   tft.setRotation(0);
   beginWeightSprite();
 
+  drawStartupScreen("INITIALIZING DISPLAY", 20);
+  applyBacklightOutput(true);
+
   touchReady = beginTouchController();
+  drawStartupScreen(touchReady ? "TOUCHSCREEN READY" : "TOUCHSCREEN ERROR",
+                    55);
   if (!touchReady && operatingMode == OperatingMode::Local) {
     // Recovery path: a saved Wi-Fi-off mode must never leave the product with
     // neither a working touchscreen nor a reachable phone interface.
@@ -5079,9 +5138,8 @@ void setup() {
   currentPage = operatingMode == OperatingMode::Web
                     ? Page::WebStatus
                     : Page::Dashboard;
+  drawStartupScreen("LOADING INTERFACE", 85);
   drawCurrentPage();
-  // Keep the backlight off until the first complete frame is ready.
-  applyBacklightOutput(true);
   if (historyStore.begin()) {
     Serial.printf("History storage ready: %u/%u entries.\n",
                   historyStore.count(),
