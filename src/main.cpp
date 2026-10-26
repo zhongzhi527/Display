@@ -81,8 +81,8 @@ constexpr uint32_t TELEMETRY_RECONNECT_MS = 8000;
 constexpr uint32_t DUAL_SAMPLE_MAX_SKEW_MS = 1000;
 constexpr uint32_t COMMAND_ACK_TIMEOUT_MS = 12000;
 constexpr uint8_t REQUIRED_GOOD_PACKETS = 2;
-constexpr uint32_t SCREEN_TIMEOUT_MS = 30000;
-constexpr uint32_t WEB_MODE_SCREEN_TIMEOUT_MS = 20000;
+constexpr uint32_t SCREEN_TIMEOUT_MS = 300000;
+constexpr uint32_t WEB_MODE_SCREEN_TIMEOUT_MS = 300000;
 constexpr uint32_t SCREEN_IDLE_WARNING_MS = 3000;
 constexpr int32_t WEIGHT_LOCK_THRESHOLD_GRAMS = 3000;
 constexpr uint32_t WEIGHT_LOCK_SETTLE_MS = 2500;
@@ -1678,7 +1678,7 @@ void drawCalibrationDynamic() {
              158,
              111,
              30,
-             "SCALE 1",
+             "LOAD CELL A",
              calibrationTargetIndex == 0 ? COLOR_PRIMARY : COLOR_PANEL_LIGHT,
              calibrationTargetIndex == 0 ? COLOR_PRIMARY : COLOR_MUTED,
              1);
@@ -1686,7 +1686,7 @@ void drawCalibrationDynamic() {
              158,
              111,
              30,
-             "SCALE 2",
+             "LOAD CELL B",
              calibrationTargetIndex == 1 ? COLOR_PRIMARY : COLOR_PANEL_LIGHT,
              calibrationTargetIndex == 1 ? COLOR_PRIMARY : COLOR_MUTED,
              1);
