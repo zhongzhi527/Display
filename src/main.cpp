@@ -1610,7 +1610,8 @@ void drawCalibrationDynamic() {
              232,
              228,
              36,
-             "TARE SCALE " + String(calibrationTargetIndex + 1),
+             "TARE LOAD CELL " +
+                 String(calibrationTargetIndex == 0 ? 'A' : 'B'),
              COLOR_PANEL_LIGHT,
              COLOR_PRIMARY,
              1);
@@ -1618,7 +1619,8 @@ void drawCalibrationDynamic() {
              276,
              228,
              37,
-             "CALIBRATE SCALE " + String(calibrationTargetIndex + 1),
+             "CALIBRATE LOAD CELL " +
+                 String(calibrationTargetIndex == 0 ? 'A' : 'B'),
              COLOR_PRIMARY,
              COLOR_PRIMARY,
              1);
