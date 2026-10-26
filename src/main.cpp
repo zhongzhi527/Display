@@ -1150,8 +1150,11 @@ void drawHeader(const String &title,
     tft.print(title);
   } else {
     tft.setTextColor(TFT_WHITE, COLOR_PANEL);
-    tft.setTextSize(2);
-    tft.setCursor(8, 12);
+    // Dashboard title uses the smaller size-1 font so it does not collide
+    // with the LINK button (which starts at x=123) and leaves room for the
+    // battery indicator at the top-right.
+    tft.setTextSize(dashboardButtons ? 1 : 2);
+    tft.setCursor(8, dashboardButtons ? 17 : 12);
     tft.print(title);
 
     if (dashboardButtons) {
@@ -1670,8 +1673,8 @@ void drawCalibrationDynamic() {
   tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
   tft.setTextSize(1);
   tft.setCursor(16, 94);
-  tft.print("KNOWN WEIGHT - SCALE ");
-  tft.print(calibrationTargetIndex + 1);
+  tft.print("KNOWN WEIGHT - LOAD CELL ");
+  tft.print(calibrationTargetIndex == 0 ? 'A' : 'B');
   drawCalibrationWeightValue();
 
   drawButton(6,
