@@ -27,6 +27,20 @@ constexpr int TOUCH_RESET_PIN = 25;
 constexpr int TOUCH_INTERRUPT_PIN = 21;
 constexpr uint8_t CST820_ADDRESS = 0x15;
 
+// Battery sensing. The LiPo (connector P5) is fed through an on-board voltage
+// divider to GPIO39 (an input-only ADC pin). Empirically the pin reads ~2.77 V
+// while the pack sits near full on USB, so the divider scales the battery down
+// by roughly 2/3; BATTERY_DIVIDER_RATIO converts the pin voltage back to the
+// pack voltage. The pack is a single-cell 3.7 V LiPo: ~4.2 V full, ~3.3 V flat.
+// If a multimeter reading of P5 is available later, adjust only the ratio.
+constexpr int BATTERY_SENSE_PIN = 39;
+constexpr float BATTERY_DIVIDER_RATIO = 1.5f;
+constexpr float BATTERY_FULL_VOLTS = 4.20f;
+constexpr float BATTERY_EMPTY_VOLTS = 3.30f;
+constexpr float BATTERY_LOW_VOLTS = 3.45f;        // ~15%; show a low warning.
+constexpr uint32_t BATTERY_SAMPLE_INTERVAL_MS = 2000;
+constexpr uint8_t BATTERY_SAMPLE_AVERAGE_COUNT = 16;
+
 constexpr int SCREEN_WIDTH = 240;
 constexpr int SCREEN_HEIGHT = 320;
 constexpr int WEIGHT_SPRITE_WIDTH = 145;
@@ -194,6 +208,15 @@ uint8_t idleWarningSecondsShown = 0;
 uint32_t currentWeightLockToken = 0;
 bool currentWeightLockSaved = false;
 uint32_t currentWeightLockRecordId = 0;
+
+// Battery state, refreshed roughly every BATTERY_SAMPLE_INTERVAL_MS.
+float batteryVolts = 0.0f;
+uint8_t batteryPercent = 0;
+bool batteryReadingValid = false;
+bool batteryLow = false;
+uint32_t lastBatterySampleMs = 0;
+int16_t batteryDrawnPercent = -1;      // -1 forces a first draw.
+bool batteryDrawnLow = false;
 
 enum class CombinedMode : uint8_t {
   None,
@@ -1049,6 +1072,91 @@ void selectCpuFrequency(uint16_t requestedFrequencyMhz) {
   uiDirty = true;
 }
 
+// Reads GPIO39, converts through the divider to a pack voltage, and maps it to
+// a 0-100% charge estimate. Averages several ADC samples to steady the value.
+void updateBatteryReading(bool force = false) {
+  const uint32_t now = millis();
+  if (!force && lastBatterySampleMs != 0 &&
+      now - lastBatterySampleMs < BATTERY_SAMPLE_INTERVAL_MS) {
+    return;
+  }
+  lastBatterySampleMs = now;
+
+  uint32_t rawSum = 0;
+  for (uint8_t i = 0; i < BATTERY_SAMPLE_AVERAGE_COUNT; ++i) {
+    rawSum += analogRead(BATTERY_SENSE_PIN);
+  }
+  const float rawAverage =
+      static_cast<float>(rawSum) / BATTERY_SAMPLE_AVERAGE_COUNT;
+
+  // ESP32 ADC: ~0..4095 over ~0..3.3 V at 11 dB attenuation.
+  const float pinVolts = (rawAverage / 4095.0f) * 3.3f;
+  const float packVolts = pinVolts * BATTERY_DIVIDER_RATIO;
+
+  // A plausible pack sits above ~2.5 V at the pin; anything far below means the
+  // sense line is not reading a battery (e.g. bench power), so flag invalid.
+  const bool valid = packVolts > 2.5f;
+
+  float percentF =
+      (packVolts - BATTERY_EMPTY_VOLTS) /
+      (BATTERY_FULL_VOLTS - BATTERY_EMPTY_VOLTS) * 100.0f;
+  percentF = constrain(percentF, 0.0f, 100.0f);
+
+  batteryVolts = packVolts;
+  batteryReadingValid = valid;
+  batteryPercent = static_cast<uint8_t>(percentF + 0.5f);
+  batteryLow = valid && packVolts <= BATTERY_LOW_VOLTS;
+}
+
+// Compact battery glyph + percentage drawn at the top-right of the header.
+// Body sits left of the right edge so it clears the SET/indicator area.
+void drawBatteryIndicator(uint16_t background) {
+  // Keep the change-tracker in sync so the loop's incremental redraw does not
+  // immediately repaint after a full-page draw.
+  batteryDrawnPercent =
+      batteryReadingValid ? static_cast<int16_t>(batteryPercent) : -1;
+  batteryDrawnLow = batteryLow;
+
+  constexpr int16_t ICON_X = 196;   // battery body left edge
+  constexpr int16_t ICON_Y = 4;
+  constexpr int16_t ICON_W = 34;
+  constexpr int16_t ICON_H = 15;
+
+  // Clear the region (icon + the % line below it).
+  tft.fillRect(ICON_X - 2, ICON_Y, SCREEN_WIDTH - (ICON_X - 2), 38, background);
+
+  if (!batteryReadingValid) {
+    // Unknown: draw an empty outline with a dash.
+    tft.drawRect(ICON_X, ICON_Y, ICON_W, ICON_H, COLOR_MUTED);
+    tft.fillRect(ICON_X + ICON_W, ICON_Y + 4, 3, 7, COLOR_MUTED);
+    setCenteredText("--", ICON_X + ICON_W / 2, ICON_Y + ICON_H / 2, 1,
+                    COLOR_MUTED, background);
+    return;
+  }
+
+  const uint16_t color =
+      batteryLow ? COLOR_DANGER
+                 : (batteryPercent >= 50 ? COLOR_SUCCESS : COLOR_WARNING);
+
+  // Battery outline + positive terminal nub.
+  tft.drawRect(ICON_X, ICON_Y, ICON_W, ICON_H, color);
+  tft.fillRect(ICON_X + ICON_W, ICON_Y + 4, 3, 7, color);
+
+  // Fill proportional to charge.
+  const int16_t innerW = ICON_W - 4;
+  const int16_t fillW =
+      static_cast<int16_t>((innerW * batteryPercent) / 100);
+  if (fillW > 0) {
+    tft.fillRect(ICON_X + 2, ICON_Y + 2, fillW, ICON_H - 4, color);
+  }
+
+  // Percentage text just below the icon.
+  char label[8];
+  snprintf(label, sizeof(label), "%u%%", batteryPercent);
+  setCenteredText(label, ICON_X + ICON_W / 2, ICON_Y + ICON_H + 8, 1, color,
+                  background);
+}
+
 void drawHeader(const String &title,
                 bool backButton,
                 bool dashboardButtons = false) {
@@ -1070,22 +1178,25 @@ void drawHeader(const String &title,
     tft.print(title);
 
     if (dashboardButtons) {
-      drawButton(123,
+      // LINK and SET are shifted left to free the top-right corner for the
+      // battery indicator.
+      drawButton(96,
                  7,
-                 51,
+                 44,
                  28,
                  "LINK",
                  COLOR_PANEL_LIGHT,
                  connectionColor(),
                  1);
-      drawButton(181,
+      drawButton(144,
                  7,
-                 54,
+                 40,
                  28,
                  "SET",
                  COLOR_PANEL_LIGHT,
                  COLOR_MUTED,
                  1);
+      drawBatteryIndicator(COLOR_PANEL);
     } else {
       const uint16_t color = connectionColor();
       tft.fillCircle(153, 21, 5, color);
@@ -1486,7 +1597,7 @@ void drawDashboardDynamic(bool force = false) {
   // Each live region is independent. Weight packets only push the sprite;
   // unchanged connection and status areas are left completely untouched.
   if (force || dashboardLinkDirty) {
-    tft.drawRoundRect(123, 7, 51, 28, 7, connectionColor());
+    tft.drawRoundRect(96, 7, 44, 28, 7, connectionColor());
     dashboardLinkDirty = false;
   }
 
@@ -3190,13 +3301,13 @@ void serviceCalibrationWeightRepeat(const TouchSample *sample) {
 }
 
 void handleDashboardTouch(const TouchSample &sample) {
-  if (pointInRect(sample.x, sample.y, 123, 7, 51, 28)) {
+  if (pointInRect(sample.x, sample.y, 96, 7, 44, 28)) {
     changePage(Page::Connectivity);
     triggerConnectivityCheck();
     return;
   }
 
-  if (pointInRect(sample.x, sample.y, 181, 7, 54, 28)) {
+  if (pointInRect(sample.x, sample.y, 144, 7, 40, 28)) {
     changePage(Page::Settings);
     return;
   }
@@ -3349,6 +3460,12 @@ void setup() {
   drawStartupScreen("INITIALIZING DISPLAY", 20);
   applyBacklightOutput(true);
 
+  // Battery sense pin is input-only; take an initial reading so the first
+  // dashboard draw shows a real value instead of a dash.
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_SENSE_PIN, ADC_11db);
+  updateBatteryReading(true);
+
   touchReady = beginTouchController();
   drawStartupScreen(touchReady ? "TOUCHSCREEN READY" : "TOUCHSCREEN ERROR",
                     55);
@@ -3422,6 +3539,20 @@ void loop() {
   serviceAutomaticWeightLock();
   serviceWeightLockSync();
   servicePeerStatusSync();
+
+  // Refresh the battery estimate periodically and redraw the header indicator
+  // only when the displayed percentage or the low-battery state changes.
+  updateBatteryReading();
+  if (currentPage == Page::Dashboard && !screenSleeping) {
+    const int16_t shownPercent =
+        batteryReadingValid ? static_cast<int16_t>(batteryPercent) : -1;
+    if (shownPercent != batteryDrawnPercent ||
+        batteryLow != batteryDrawnLow) {
+      batteryDrawnPercent = shownPercent;
+      batteryDrawnLow = batteryLow;
+      drawBatteryIndicator(COLOR_PANEL);
+    }
+  }
 
   if (!noticeMessage.isEmpty() && !noticeActive()) {
     noticeMessage = "";
