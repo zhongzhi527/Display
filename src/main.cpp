@@ -40,6 +40,18 @@ constexpr float BATTERY_EMPTY_VOLTS = 3.30f;
 constexpr float BATTERY_LOW_VOLTS = 3.45f;        // ~15%; show a low warning.
 constexpr uint32_t BATTERY_SAMPLE_INTERVAL_MS = 2000;
 constexpr uint8_t BATTERY_SAMPLE_AVERAGE_COUNT = 16;
+// Smoothing so the gauge does not jitter. Each refresh the displayed estimate
+// eases this fraction of the way toward the newest raw reading (0..1): smaller
+// = steadier/slower. At 0.15 with a 2 s refresh the reading settles over ~20 s.
+constexpr float BATTERY_SMOOTHING_FACTOR = 0.15f;
+// Only ever change the shown percentage by at most this many points per refresh
+// so a momentary voltage spike (e.g. plugging in a charger) cannot make the
+// gauge leap. Combined with the charging ratchet this makes it climb gently.
+constexpr uint8_t BATTERY_MAX_STEP_PER_REFRESH = 1;
+// If the pin voltage suddenly rises well above the resting trend, the charger
+// is pushing it up; in that case only let the gauge ratchet upward slowly
+// rather than snapping to the inflated charging voltage.
+constexpr float BATTERY_CHARGING_JUMP_VOLTS = 0.08f;
 
 constexpr int SCREEN_WIDTH = 240;
 constexpr int SCREEN_HEIGHT = 320;
@@ -210,8 +222,9 @@ bool currentWeightLockSaved = false;
 uint32_t currentWeightLockRecordId = 0;
 
 // Battery state, refreshed roughly every BATTERY_SAMPLE_INTERVAL_MS.
-float batteryVolts = 0.0f;
-uint8_t batteryPercent = 0;
+float batteryVolts = 0.0f;              // smoothed pack voltage (displayed basis)
+float batterySmoothedPercent = -1.0f;   // smoothed %, -1 until first sample
+uint8_t batteryPercent = 0;             // integer % actually shown
 bool batteryReadingValid = false;
 bool batteryLow = false;
 uint32_t lastBatterySampleMs = 0;
@@ -1073,7 +1086,11 @@ void selectCpuFrequency(uint16_t requestedFrequencyMhz) {
 }
 
 // Reads GPIO39, converts through the divider to a pack voltage, and maps it to
-// a 0-100% charge estimate. Averages several ADC samples to steady the value.
+// a 0-100% charge estimate. The raw reading is both averaged (across ADC
+// samples) and smoothed (across time) so the gauge does not jitter, and the
+// displayed percentage is rate-limited so it never leaps - including when a
+// charger suddenly pushes the voltage up. The result is a steady number that
+// holds its place and then climbs gently while charging.
 void updateBatteryReading(bool force = false) {
   const uint32_t now = millis();
   if (!force && lastBatterySampleMs != 0 &&
@@ -1096,16 +1113,48 @@ void updateBatteryReading(bool force = false) {
   // A plausible pack sits above ~2.5 V at the pin; anything far below means the
   // sense line is not reading a battery (e.g. bench power), so flag invalid.
   const bool valid = packVolts > 2.5f;
-
-  float percentF =
-      (packVolts - BATTERY_EMPTY_VOLTS) /
-      (BATTERY_FULL_VOLTS - BATTERY_EMPTY_VOLTS) * 100.0f;
-  percentF = constrain(percentF, 0.0f, 100.0f);
-
-  batteryVolts = packVolts;
   batteryReadingValid = valid;
-  batteryPercent = static_cast<uint8_t>(percentF + 0.5f);
-  batteryLow = valid && packVolts <= BATTERY_LOW_VOLTS;
+  if (!valid) {
+    return;
+  }
+
+  // Smooth the voltage over time. A sudden jump upward (charger just kicked in)
+  // is damped harder so the gauge does not snap to the inflated voltage.
+  if (batteryVolts <= 0.0f) {
+    batteryVolts = packVolts;  // first valid sample seeds the filter
+  } else {
+    const bool chargingJump =
+        packVolts > batteryVolts + BATTERY_CHARGING_JUMP_VOLTS;
+    const float factor =
+        chargingJump ? (BATTERY_SMOOTHING_FACTOR * 0.4f)
+                     : BATTERY_SMOOTHING_FACTOR;
+    batteryVolts += (packVolts - batteryVolts) * factor;
+  }
+
+  // Map the smoothed voltage to a target percentage.
+  float targetPercent =
+      (batteryVolts - BATTERY_EMPTY_VOLTS) /
+      (BATTERY_FULL_VOLTS - BATTERY_EMPTY_VOLTS) * 100.0f;
+  targetPercent = constrain(targetPercent, 0.0f, 100.0f);
+
+  // Seed, then move the displayed percentage toward the target by at most
+  // BATTERY_MAX_STEP_PER_REFRESH points per refresh so it never leaps.
+  if (batterySmoothedPercent < 0.0f) {
+    batterySmoothedPercent = targetPercent;
+  } else {
+    const float delta = targetPercent - batterySmoothedPercent;
+    const float step = BATTERY_MAX_STEP_PER_REFRESH;
+    if (delta > step) {
+      batterySmoothedPercent += step;
+    } else if (delta < -step) {
+      batterySmoothedPercent -= step;
+    } else {
+      batterySmoothedPercent = targetPercent;
+    }
+  }
+
+  batteryPercent = static_cast<uint8_t>(batterySmoothedPercent + 0.5f);
+  batteryLow = batteryVolts <= BATTERY_LOW_VOLTS;
 }
 
 // Compact battery glyph + percentage drawn at the top-right of the header.
