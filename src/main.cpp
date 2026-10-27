@@ -44,16 +44,6 @@ constexpr uint8_t BATTERY_SAMPLE_AVERAGE_COUNT = 16;
 // eases this fraction of the way toward the newest raw reading (0..1): smaller
 // = steadier/slower. At 0.15 with a 2 s refresh the reading settles over ~20 s.
 constexpr float BATTERY_SMOOTHING_FACTOR = 0.15f;
-// Charging detection. With no dedicated charge-detect pin we infer charging
-// from the pack voltage: a charger holds it high. Hysteresis (separate enter /
-// exit thresholds) stops the state flickering at the boundary.
-constexpr float BATTERY_CHARGING_ENTER_VOLTS = 4.08f;  // above -> charging
-constexpr float BATTERY_CHARGING_EXIT_VOLTS = 3.98f;   // below -> on battery
-// While charging the true charge cannot be read from voltage (it is inflated),
-// so the gauge only creeps up this many points per refresh and never shows a
-// full 100% until the charger is removed and the resting voltage confirms it.
-constexpr uint8_t BATTERY_CHARGING_MAX_STEP = 1;
-constexpr uint8_t BATTERY_CHARGING_PERCENT_CAP = 99;
 
 constexpr int SCREEN_WIDTH = 240;
 constexpr int SCREEN_HEIGHT = 320;
@@ -229,11 +219,9 @@ float batterySmoothedPercent = -1.0f;   // smoothed %, -1 until first sample
 uint8_t batteryPercent = 0;             // integer % actually shown
 bool batteryReadingValid = false;
 bool batteryLow = false;
-bool batteryCharging = false;           // inferred from a sustained high voltage
 uint32_t lastBatterySampleMs = 0;
 int16_t batteryDrawnPercent = -1;      // -1 forces a first draw.
 bool batteryDrawnLow = false;
-int8_t batteryDrawnCharging = -1;      // -1 forces a first draw.
 
 enum class CombinedMode : uint8_t {
   None,
@@ -1129,44 +1117,17 @@ void updateBatteryReading(bool force = false) {
     batteryVolts += (packVolts - batteryVolts) * BATTERY_SMOOTHING_FACTOR;
   }
 
-  // Infer charging from a sustained high pack voltage. Hysteresis: once above
-  // the enter threshold we treat it as charging until it falls below the lower
-  // exit threshold, so the state does not flicker at the boundary.
-  if (!batteryCharging && batteryVolts >= BATTERY_CHARGING_ENTER_VOLTS) {
-    batteryCharging = true;
-  } else if (batteryCharging && batteryVolts <= BATTERY_CHARGING_EXIT_VOLTS) {
-    batteryCharging = false;
-  }
-
-  // Map the smoothed voltage to a percentage from the resting LiPo curve.
+  // Map the smoothed voltage to a percentage from the LiPo curve and show it
+  // directly. The voltage filter already keeps this steady; no charging-state
+  // logic is attempted because this board exposes no reliable charge signal.
   float targetPercent =
       (batteryVolts - BATTERY_EMPTY_VOLTS) /
       (BATTERY_FULL_VOLTS - BATTERY_EMPTY_VOLTS) * 100.0f;
   targetPercent = constrain(targetPercent, 0.0f, 100.0f);
-
-  if (batterySmoothedPercent < 0.0f) {
-    // First sample: show the real value immediately.
-    batterySmoothedPercent = targetPercent;
-  } else if (batteryCharging) {
-    // Charging: the voltage is inflated, so do not trust it as the true charge.
-    // Only creep upward slowly, never downward, and hold below 100% until the
-    // charger is removed and the resting voltage can confirm a full pack.
-    const float cap = static_cast<float>(BATTERY_CHARGING_PERCENT_CAP);
-    const float ceiling = min(targetPercent, cap);
-    if (batterySmoothedPercent < ceiling) {
-      batterySmoothedPercent =
-          min(ceiling, batterySmoothedPercent + BATTERY_CHARGING_MAX_STEP);
-    }
-    // If the estimate is already at/above the ceiling, leave it put (no
-    // misleading downward crawl while plugged in).
-  } else {
-    // On battery: track the resting-voltage percentage directly. It only falls
-    // as the pack drains, so snap to it rather than crawling.
-    batterySmoothedPercent = targetPercent;
-  }
+  batterySmoothedPercent = targetPercent;
 
   batteryPercent = static_cast<uint8_t>(batterySmoothedPercent + 0.5f);
-  batteryLow = !batteryCharging && batteryVolts <= BATTERY_LOW_VOLTS;
+  batteryLow = batteryVolts <= BATTERY_LOW_VOLTS;
 }
 
 // Compact battery glyph + percentage drawn at the top-right of the header.
@@ -1177,7 +1138,6 @@ void drawBatteryIndicator(uint16_t background) {
   batteryDrawnPercent =
       batteryReadingValid ? static_cast<int16_t>(batteryPercent) : -1;
   batteryDrawnLow = batteryLow;
-  batteryDrawnCharging = batteryReadingValid ? (batteryCharging ? 1 : 0) : -1;
 
   constexpr int16_t ICON_X = 196;   // battery body left edge
   constexpr int16_t ICON_Y = 4;
@@ -1212,28 +1172,9 @@ void drawBatteryIndicator(uint16_t background) {
     tft.fillRect(ICON_X + 2, ICON_Y + 2, fillW, ICON_H - 4, color);
   }
 
-  // When charging, draw a small lightning bolt centred in the battery body so
-  // it is obvious the pack is being charged.
-  if (batteryCharging) {
-    const int16_t cx = ICON_X + ICON_W / 2;
-    const uint16_t bolt = TFT_WHITE;
-    // Upper-left-to-centre stroke (drawn twice for a thicker line).
-    tft.drawLine(cx + 2, ICON_Y + 2, cx - 3, ICON_Y + ICON_H / 2, bolt);
-    tft.drawLine(cx + 3, ICON_Y + 2, cx - 2, ICON_Y + ICON_H / 2, bolt);
-    // Centre-to-lower-right stroke.
-    tft.drawLine(cx - 3, ICON_Y + ICON_H / 2, cx + 2, ICON_Y + ICON_H - 3,
-                 bolt);
-    tft.drawLine(cx - 2, ICON_Y + ICON_H / 2, cx + 3, ICON_Y + ICON_H - 3,
-                 bolt);
-  }
-
-  // Text just below the icon: percentage, with a '+' marker while charging.
-  char label[12];
-  if (batteryCharging) {
-    snprintf(label, sizeof(label), "%u%% +", batteryPercent);
-  } else {
-    snprintf(label, sizeof(label), "%u%%", batteryPercent);
-  }
+  // Percentage text just below the icon.
+  char label[8];
+  snprintf(label, sizeof(label), "%u%%", batteryPercent);
   setCenteredText(label, ICON_X + ICON_W / 2, ICON_Y + ICON_H + 8, 1, color,
                   background);
 }
@@ -3627,14 +3568,10 @@ void loop() {
   if (currentPage == Page::Dashboard && !screenSleeping) {
     const int16_t shownPercent =
         batteryReadingValid ? static_cast<int16_t>(batteryPercent) : -1;
-    const int8_t shownCharging =
-        batteryReadingValid ? (batteryCharging ? 1 : 0) : -1;
     if (shownPercent != batteryDrawnPercent ||
-        batteryLow != batteryDrawnLow ||
-        shownCharging != batteryDrawnCharging) {
+        batteryLow != batteryDrawnLow) {
       batteryDrawnPercent = shownPercent;
       batteryDrawnLow = batteryLow;
-      batteryDrawnCharging = shownCharging;
       drawBatteryIndicator(COLOR_PANEL);
     }
   }
