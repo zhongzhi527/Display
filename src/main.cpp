@@ -251,6 +251,7 @@ enum class ScaleBorderMode : uint8_t {
   Error,
   Locked,
   Inactive,
+  Offline,  // not linked over BLE -> pulsing red (distinct from Error)
 };
 
 struct ControlActionResult {
@@ -1314,8 +1315,9 @@ String dashboardScaleStatus(uint8_t index) {
     return "BT ERROR";
   }
   if (!state.connected) {
-    return state.connecting ? "CONNECTING"
-                            : (state.discovered ? "RETRYING" : "SEARCHING");
+    // Not linked over BLE -> OFFLINE (red). (The internal connecting/
+    // discovered distinction is no longer surfaced as separate wording.)
+    return "OFFLINE";
   }
   if (state.status == DualScaleBle::Status::NoSensor) {
     return "NO SENSOR";
@@ -1348,21 +1350,29 @@ String dashboardScaleStatus(uint8_t index) {
   if (weightLockPhase == WeightLockPhase::Locked) {
     return "LOCKED";
   }
+  // Connected and still building up good packets: still SYNCING (was
+  // "STABILIZING") so the user sees a clean OFFLINE -> SYNCING -> CONNECTED
+  // lifecycle.
   if (state.goodPacketCount < REQUIRED_GOOD_PACKETS) {
-    return "STABILIZING";
+    return "SYNCING";
   }
-  return scaleUsable(index) ? "READY" : "NOT READY";
+  // Fully linked and healthy -> CONNECTED (was "READY").
+  return scaleUsable(index) ? "CONNECTED" : "NOT READY";
 }
 
 uint16_t dashboardScaleColor(uint8_t index) {
   const String status = dashboardScaleStatus(index);
-  if (status == "READY" || status == "LOCKED") {
+  // Green once fully linked/healthy or when holding a locked reading.
+  if (status == "CONNECTED" || status == "LOCKED") {
     return COLOR_SUCCESS;
   }
-  if (status == "BT ERROR" || status == "NO SENSOR" ||
+  // Red for OFFLINE and hard fault states.
+  if (status == "OFFLINE" || status == "BT ERROR" || status == "NO SENSOR" ||
       status == "ADC ERROR" || status == "STALE DATA") {
     return COLOR_DANGER;
   }
+  // Everything else (SYNCING, TARING, CALIBRATING, NEEDS *, NOT READY) is
+  // yellow/amber.
   return COLOR_WARNING;
 }
 
@@ -1404,7 +1414,8 @@ ScaleBorderMode dashboardScaleBorderMode(uint8_t index) {
     return ScaleBorderMode::Error;
   }
   if (!state.connected) {
-    return ScaleBorderMode::Searching;
+    // OFFLINE -> pulsing red, matching the red OFFLINE status text.
+    return ScaleBorderMode::Offline;
   }
   if (state.status == DualScaleBle::Status::NoSensor ||
       state.status == DualScaleBle::Status::SensorError) {
@@ -1463,6 +1474,10 @@ uint16_t dashboardScaleBorderColor(uint8_t index) {
   case ScaleBorderMode::Error:
     return animatedScaleBorderColor(
         COLOR_DANGER, SCALE_BORDER_ERROR_BLINK_MS);
+  case ScaleBorderMode::Offline:
+    // Not linked -> pulse red (same colour as Error, its own flash period).
+    return animatedScaleBorderColor(
+        COLOR_DANGER, SCALE_BORDER_SEARCH_BLINK_MS);
   case ScaleBorderMode::Locked:
     return COLOR_PRIMARY;
   case ScaleBorderMode::Inactive:
@@ -1923,22 +1938,26 @@ String scaleLinkLabel(uint8_t index) {
     return "BT ERROR";
   }
   if (state.connected) {
-    return state.identityVerified ? "CONNECTED" : "VERIFYING";
+    // Linked -> CONNECTED once verified, otherwise still SYNCING.
+    return state.identityVerified ? "CONNECTED" : "SYNCING";
   }
-  if (state.connecting) {
-    return "CONNECTING";
-  }
-  return state.discovered ? "RETRYING" : "SEARCHING";
+  // Not linked -> OFFLINE (matches the dashboard's red OFFLINE wording).
+  return "OFFLINE";
 }
 
 uint16_t scaleLinkColor(uint8_t index) {
   const ScaleState &state = scaleStates[index];
+  // CONNECTED (linked + verified) -> green.
   if (state.connected && state.identityVerified) {
     return COLOR_SUCCESS;
   }
-  if (bluetoothReady && (state.connecting || state.discovered)) {
+  // SYNCING (linked but not yet verified, or still connecting/discovered)
+  // -> yellow.
+  if (bluetoothReady &&
+      (state.connected || state.connecting || state.discovered)) {
     return COLOR_WARNING;
   }
+  // OFFLINE / BT error -> red.
   return COLOR_DANGER;
 }
 
@@ -2147,10 +2166,15 @@ void drawConnectivityPage() {
                     9,
                     COLOR_PANEL);
 
-  setCenteredText("SCALE 1",
+  // "LOAD CELL A/B" is wider than the old "SCALE 1/2"; at text size 2 it
+  // (11 chars) would overflow the 111px panel, so these titles are drawn at
+  // size 1 - the same size the dashboard and calibrate page use for the same
+  // label. The muted "LOAD-CELL ESP32" subtitle just below completes the
+  // two-line heading.
+  setCenteredText("LOAD CELL A",
                   LEFT_CENTER_X,
-                  66,
-                  2,
+                  70,
+                  1,
                   TFT_WHITE,
                   COLOR_PANEL);
   setCenteredText("LOAD-CELL ESP32",
@@ -2159,10 +2183,10 @@ void drawConnectivityPage() {
                   1,
                   COLOR_MUTED,
                   COLOR_PANEL);
-  setCenteredText("SCALE 2",
+  setCenteredText("LOAD CELL B",
                   RIGHT_CENTER_X,
-                  66,
-                  2,
+                  70,
+                  1,
                   TFT_WHITE,
                   COLOR_PANEL);
   setCenteredText("LOAD-CELL ESP32",
