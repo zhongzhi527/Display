@@ -74,6 +74,12 @@ constexpr char LOCAL_BLUETOOTH_NAME[] = "LOAD_CELL_DISPLAY";
 constexpr char SETTINGS_NAMESPACE[] = "display_ui";
 constexpr char BRIGHTNESS_KEY[] = "brightness";
 constexpr char CPU_FREQUENCY_KEY[] = "cpu_mhz";
+constexpr char LOCK_THRESHOLD_KG_KEY[] = "lock_kg";
+constexpr char AUTO_LOCK_KEY[] = "auto_lock";
+constexpr float DEFAULT_LOCK_THRESHOLD_KG = 5.0f;
+constexpr float MIN_LOCK_THRESHOLD_KG = 0.0f;
+constexpr float MAX_LOCK_THRESHOLD_KG = 100.0f;
+constexpr float LOCK_THRESHOLD_STEP_KG = 0.5f;
 constexpr uint32_t RECONNECT_INTERVAL_MS = 3000;
 constexpr uint32_t BLE_CONNECT_TIMEOUT_MS = 5000;
 constexpr uint32_t BLE_SCAN_WINDOW_MS = 4000;
@@ -202,6 +208,8 @@ float calibrationWeightKg = 1.0f;
 uint8_t brightnessPercent = DEFAULT_BRIGHTNESS_PERCENT;
 uint8_t calibrationTargetIndex = 0;
 uint16_t cpuFrequencyMhz = DEFAULT_CPU_FREQUENCY_MHZ;
+float lockThresholdKg = DEFAULT_LOCK_THRESHOLD_KG;
+bool autoLockEnabled = true;
 String noticeMessage;
 
 uint32_t lastTouchActionMs = 0;
@@ -1027,6 +1035,16 @@ void loadDisplaySettings() {
     cpuFrequencyMhz = supportedCpuFrequency(storedCpuFrequency)
                           ? storedCpuFrequency
                           : DEFAULT_CPU_FREQUENCY_MHZ;
+
+    lockThresholdKg =
+        settingsPreferences.getFloat(LOCK_THRESHOLD_KG_KEY,
+                                     DEFAULT_LOCK_THRESHOLD_KG);
+    lockThresholdKg = constrain(lockThresholdKg,
+                                MIN_LOCK_THRESHOLD_KG,
+                                MAX_LOCK_THRESHOLD_KG);
+
+    autoLockEnabled =
+        settingsPreferences.getUChar(AUTO_LOCK_KEY, 1) != 0;
   }
 
   if (!setCpuFrequencyMhz(cpuFrequencyMhz)) {
@@ -1036,6 +1054,8 @@ void loadDisplaySettings() {
 
   Serial.printf("Display brightness: %u%%\n", brightnessPercent);
   Serial.printf("CPU frequency: %u MHz\n", cpuFrequencyMhz);
+  Serial.printf("Lock above: %.1f kg\n", lockThresholdKg);
+  Serial.printf("Auto-lock: %s\n", autoLockEnabled ? "ON" : "OFF");
 }
 
 void adjustBrightness(int amountPercent) {
@@ -1793,36 +1813,66 @@ void drawCalibrationPage() {
   drawCalibrationDynamic();
 }
 
+// Live values for the four settings groups. Kept in drawSettingsDynamic() so
+// the page refreshes the readouts without a full redraw. Each value sits in a
+// fixed strip on the left of its panel; the control buttons live to the right.
 void drawSettingsDynamic() {
-  tft.fillRect(20, 75, 200, 33, COLOR_PANEL);
-  setCenteredText(String(brightnessPercent) + "%",
-                  SCREEN_WIDTH / 2,
-                  91,
-                  3,
-                  TFT_WHITE,
-                  COLOR_PANEL);
-
-  tft.fillRect(20, 191, 200, 33, COLOR_PANEL);
-  setCenteredText(String(cpuFrequencyMhz) + " MHz",
-                  SCREEN_WIDTH / 2,
-                  207,
+  // LOCK ABOVE value ("X.X kg").
+  tft.fillRect(14, 78, 110, 24, COLOR_PANEL);
+  setCenteredText(String(lockThresholdKg, 1) + " kg",
+                  68,
+                  90,
                   2,
                   TFT_WHITE,
                   COLOR_PANEL);
 
-  drawButton(12,
-             230,
-             102,
-             40,
-             "160 MHz",
+  // AUTO-LOCK value ("ON"/"OFF").
+  tft.fillRect(14, 144, 110, 24, COLOR_PANEL);
+  setCenteredText(autoLockEnabled ? "ON" : "OFF",
+                  68,
+                  156,
+                  2,
+                  autoLockEnabled ? COLOR_SUCCESS : COLOR_MUTED,
+                  COLOR_PANEL);
+  drawButton(132,
+             138,
+             96,
+             30,
+             "TOGGLE",
+             COLOR_PANEL_LIGHT,
+             COLOR_PRIMARY,
+             1);
+
+  // DISPLAY BRIGHTNESS value ("N%").
+  tft.fillRect(14, 210, 110, 24, COLOR_PANEL);
+  setCenteredText(String(brightnessPercent) + "%",
+                  68,
+                  222,
+                  2,
+                  TFT_WHITE,
+                  COLOR_PANEL);
+
+  // ESP32 CPU CLOCK value ("NNN MHz").
+  tft.fillRect(14, 282, 100, 22, COLOR_PANEL);
+  setCenteredText(String(cpuFrequencyMhz) + " MHz",
+                  62,
+                  293,
+                  1,
+                  TFT_WHITE,
+                  COLOR_PANEL);
+  drawButton(120,
+             272,
+             52,
+             34,
+             "160",
              cpuFrequencyMhz == 160 ? COLOR_PRIMARY : COLOR_PANEL_LIGHT,
              cpuFrequencyMhz == 160 ? COLOR_PRIMARY : COLOR_MUTED,
              1);
-  drawButton(126,
-             230,
-             102,
-             40,
-             "240 MHz",
+  drawButton(178,
+             272,
+             52,
+             34,
+             "240",
              cpuFrequencyMhz == 240 ? COLOR_PRIMARY : COLOR_PANEL_LIGHT,
              cpuFrequencyMhz == 240 ? COLOR_PRIMARY : COLOR_MUTED,
              1);
@@ -1832,32 +1882,36 @@ void drawSettingsPage() {
   tft.fillScreen(COLOR_BACKGROUND);
   drawHeader("SETTINGS", true);
 
-  tft.fillRoundRect(6, 51, 228, 106, 9, COLOR_PANEL);
+  // --- LOCK ABOVE (threshold in kg, -/+ 0.5 kg steps) ---
+  tft.fillRoundRect(6, 48, 228, 60, 9, COLOR_PANEL);
   tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
   tft.setTextSize(1);
-  tft.setCursor(16, 61);
-  tft.print("DISPLAY BRIGHTNESS");
-  drawButton(12,
-             116,
-             92,
-             34,
-             "-10%",
-             COLOR_PANEL_LIGHT,
-             COLOR_MUTED,
-             1);
-  drawButton(136,
-             116,
-             92,
-             34,
-             "+10%",
-             COLOR_PANEL_LIGHT,
-             COLOR_MUTED,
-             1);
+  tft.setCursor(16, 55);
+  tft.print("LOCK ABOVE");
+  drawButton(132, 72, 44, 30, "-", COLOR_PANEL_LIGHT, COLOR_MUTED, 2);
+  drawButton(184, 72, 44, 30, "+", COLOR_PANEL_LIGHT, COLOR_MUTED, 2);
 
-  tft.fillRoundRect(6, 167, 228, 113, 9, COLOR_PANEL);
+  // --- AUTO-LOCK (ON/OFF toggle) ---
+  tft.fillRoundRect(6, 114, 228, 60, 9, COLOR_PANEL);
   tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
   tft.setTextSize(1);
-  tft.setCursor(16, 177);
+  tft.setCursor(16, 121);
+  tft.print("AUTO-LOCK");
+
+  // --- DISPLAY BRIGHTNESS (-10% / +10%) ---
+  tft.fillRoundRect(6, 180, 228, 60, 9, COLOR_PANEL);
+  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setCursor(16, 187);
+  tft.print("DISPLAY BRIGHTNESS");
+  drawButton(132, 204, 44, 30, "-10%", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
+  drawButton(184, 204, 44, 30, "+10%", COLOR_PANEL_LIGHT, COLOR_MUTED, 1);
+
+  // --- ESP32 CPU CLOCK (160 / 240 MHz) ---
+  tft.fillRoundRect(6, 246, 228, 66, 9, COLOR_PANEL);
+  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  tft.setTextSize(1);
+  tft.setCursor(16, 253);
   tft.print("ESP32 CPU CLOCK");
 
   drawSettingsDynamic();
@@ -3152,6 +3206,76 @@ ControlActionResult requestControllerTare(uint8_t targetMask,
   return result;
 }
 
+// Push the current lock threshold to every connected+verified scale. Unlike a
+// tare/calibration these are plain settings, so there are no health/tare
+// preconditions; scales that are offline simply pick it up next time they
+// connect (or on the next change).
+void applyLockThresholdToScales() {
+  const int32_t thresholdGrams =
+      static_cast<int32_t>(lroundf(lockThresholdKg * 1000.0f));
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    const ScaleState &state = scaleStates[index];
+    if (!state.connected || !state.identityVerified) {
+      continue;
+    }
+    if (queueScaleCommand(index,
+                          DualScaleBle::CommandType::SetLockThreshold,
+                          thresholdGrams)) {
+      Serial.printf("Sent lock threshold %ld g to Scale %u.\n",
+                    static_cast<long>(thresholdGrams),
+                    index + 1);
+    }
+  }
+}
+
+void applyAutoLockToScales() {
+  const int32_t value = autoLockEnabled ? 1 : 0;
+  for (uint8_t index = 0; index < REMOTE_SCALE_COUNT; ++index) {
+    const ScaleState &state = scaleStates[index];
+    if (!state.connected || !state.identityVerified) {
+      continue;
+    }
+    if (queueScaleCommand(index,
+                          DualScaleBle::CommandType::SetAutoLock,
+                          value)) {
+      Serial.printf("Sent auto-lock %s to Scale %u.\n",
+                    autoLockEnabled ? "ON" : "OFF",
+                    index + 1);
+    }
+  }
+}
+
+void adjustLockThreshold(float deltaKg) {
+  // Clamp to [0,100] and snap to clean 0.5 kg steps.
+  const float raw = constrain(lockThresholdKg + deltaKg,
+                              MIN_LOCK_THRESHOLD_KG,
+                              MAX_LOCK_THRESHOLD_KG);
+  const float snapped = roundf(raw / LOCK_THRESHOLD_STEP_KG) *
+                        LOCK_THRESHOLD_STEP_KG;
+  if (fabsf(snapped - lockThresholdKg) < 0.001f) {
+    return;
+  }
+
+  lockThresholdKg = snapped;
+  if (settingsPreferencesReady) {
+    settingsPreferences.putFloat(LOCK_THRESHOLD_KG_KEY, lockThresholdKg);
+  }
+  Serial.printf("Lock-above threshold changed to %.1f kg.\n",
+                lockThresholdKg);
+  applyLockThresholdToScales();
+  uiDirty = true;
+}
+
+void toggleAutoLock() {
+  autoLockEnabled = !autoLockEnabled;
+  if (settingsPreferencesReady) {
+    settingsPreferences.putUChar(AUTO_LOCK_KEY, autoLockEnabled ? 1 : 0);
+  }
+  Serial.printf("Auto-lock toggled %s.\n", autoLockEnabled ? "ON" : "OFF");
+  applyAutoLockToScales();
+  uiDirty = true;
+}
+
 ControlActionResult requestControllerCalibration(uint8_t scaleIndex,
                                                  int32_t valueGrams,
                                                  const char *source) {
@@ -3401,22 +3525,41 @@ void handleSettingsTouch(const TouchSample &sample) {
     return;
   }
 
-  if (pointInRect(sample.x, sample.y, 12, 116, 92, 34)) {
+  // LOCK ABOVE: -/+ 0.5 kg steps.
+  if (pointInRect(sample.x, sample.y, 132, 72, 44, 30)) {
+    adjustLockThreshold(-LOCK_THRESHOLD_STEP_KG);
+    return;
+  }
+
+  if (pointInRect(sample.x, sample.y, 184, 72, 44, 30)) {
+    adjustLockThreshold(LOCK_THRESHOLD_STEP_KG);
+    return;
+  }
+
+  // AUTO-LOCK: TOGGLE.
+  if (pointInRect(sample.x, sample.y, 132, 138, 96, 30)) {
+    toggleAutoLock();
+    return;
+  }
+
+  // DISPLAY BRIGHTNESS: -10% / +10%.
+  if (pointInRect(sample.x, sample.y, 132, 204, 44, 30)) {
     adjustBrightness(-BRIGHTNESS_STEP_PERCENT);
     return;
   }
 
-  if (pointInRect(sample.x, sample.y, 136, 116, 92, 34)) {
+  if (pointInRect(sample.x, sample.y, 184, 204, 44, 30)) {
     adjustBrightness(BRIGHTNESS_STEP_PERCENT);
     return;
   }
 
-  if (pointInRect(sample.x, sample.y, 12, 230, 102, 40)) {
+  // ESP32 CPU CLOCK: 160 / 240 MHz.
+  if (pointInRect(sample.x, sample.y, 120, 272, 52, 34)) {
     selectCpuFrequency(160);
     return;
   }
 
-  if (pointInRect(sample.x, sample.y, 126, 230, 102, 40)) {
+  if (pointInRect(sample.x, sample.y, 178, 272, 52, 34)) {
     selectCpuFrequency(240);
     return;
   }
