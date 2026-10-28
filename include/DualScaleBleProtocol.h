@@ -43,6 +43,8 @@ enum class CommandType : uint8_t {
   PeerStatus = 4,
   SetWeightLock = 5,
   ClearWeightLock = 6,
+  SetLockThreshold = 7,
+  SetAutoLock = 8,
 };
 
 enum class CommandResult : uint8_t {
