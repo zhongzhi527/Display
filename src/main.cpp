@@ -63,13 +63,6 @@ constexpr uint8_t BRIGHTNESS_STEP_PERCENT = 10;
 constexpr uint8_t DEFAULT_BRIGHTNESS_PERCENT = 100;
 constexpr uint16_t DEFAULT_CPU_FREQUENCY_MHZ = 240;
 
-constexpr uint8_t HISTORY_PAGE_DEFAULT_LIMIT = 10;
-constexpr uint8_t HISTORY_PAGE_MAX_LIMIT = 20;
-constexpr uint64_t HISTORY_MIN_TIMESTAMP_MS = 1577836800000ULL;
-constexpr uint64_t HISTORY_MAX_TIMESTAMP_MS = 4102444800000ULL;
-constexpr int16_t HISTORY_MIN_TIMEZONE_OFFSET_MINUTES = -840;
-constexpr int16_t HISTORY_MAX_TIMEZONE_OFFSET_MINUTES = 840;
-
 constexpr char LOCAL_BLUETOOTH_NAME[] = "LOAD_CELL_DISPLAY";
 constexpr char SETTINGS_NAMESPACE[] = "display_ui";
 constexpr char BRIGHTNESS_KEY[] = "brightness";
@@ -3463,7 +3456,6 @@ void processTouch(const TouchSample &sample, bool newTouch) {
   }
   lastTouchActionMs = millis();
 
-  Serial.printf("Touch: x=%u y=%u\n", sample.x, sample.y);
   if (currentPage == Page::Dashboard) {
     handleDashboardTouch(sample);
   } else if (currentPage == Page::Calibration) {
